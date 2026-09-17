@@ -1,0 +1,1857 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# DevX — local polyglot project runtime wrapper.
+# Automates infra/runtime only (stack generation, domain+TLS, containers).
+# Dependency installs (composer/npm/pip/...) stay manual on purpose.
+
+DEVX_OS="$(uname -s)"   # "Darwin" (macOS) or "Linux" (any distro, incl. WSL2)
+DEVX_HOME="${HOME}/workspace/.devx"
+GLOBAL_COMPOSE="${DEVX_HOME}/compose.global.yml"
+GLOBAL_PROJECT="devx-global"
+INGRESS_NETWORK="devx_ingress"
+DEVX_PARSER="${DEVX_HOME}/lib/parse-manifest.py"
+workspace_root="${HOME}/workspace"
+REQUESTED_PHP_SERVER=""
+DEVX_MF_FILE=""
+DEVX_COMPOSE_FILES=()
+_COMPOSE_SERVICES_CACHE=""
+
+cleanup() {
+  [[ -n "${DEVX_MF_FILE}" && -f "${DEVX_MF_FILE}" ]] && rm -f "${DEVX_MF_FILE}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+err() {
+  echo "dev: $*" >&2
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    err "missing required command: $1"
+    exit 1
+  }
+}
+
+docker_ok() {
+  docker info >/dev/null 2>&1
+}
+
+require_docker() {
+  if ! docker_ok; then
+    if [[ "${DEVX_OS}" == "Darwin" ]]; then
+      err "Docker is not running. Start Docker Desktop (or OrbStack), then retry."
+    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
+      err "docker is running but not reachable — check group membership (groups | grep docker) or DOCKER_HOST."
+    elif command -v systemctl >/dev/null 2>&1; then
+      err "docker is not running. Start it: sudo systemctl start docker"
+    else
+      err "docker is not running or not reachable. On WSL2: enable this distro under Docker Desktop → Settings → Resources → WSL Integration."
+    fi
+    exit 1
+  fi
+}
+
+find_project_root() {
+  local current="${PWD}"
+  while [[ "${current}" != "/" ]]; do
+    if [[ "${current%/*}" == "${workspace_root}/work" || "${current%/*}" == "${workspace_root}/personal" ]]; then
+      echo "${current}"
+      return 0
+    fi
+    current="$(dirname "${current}")"
+  done
+  return 1
+}
+
+sanitize_slug() {
+  printf "%s" "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -cs 'a-z0-9' '-' \
+    | sed -E 's/^-+//; s/-+$//'
+}
+
+# ---------------------------------------------------------------------------
+# Manifest (.devx.yml) — optional per-project override
+# ---------------------------------------------------------------------------
+
+parse_manifest() {
+  DEVX_MF_FILE=""
+  local src=""
+  if [[ -f "${PROJECT_ROOT}/.devx.yml" ]]; then
+    src="${PROJECT_ROOT}/.devx.yml"
+  elif [[ -f "${PROJECT_ROOT}/.devx.yaml" ]]; then
+    src="${PROJECT_ROOT}/.devx.yaml"
+  else
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    err "found $(basename "${src}") but python3 is missing; ignoring manifest"
+    return 0
+  fi
+  if [[ ! -f "${DEVX_PARSER}" ]]; then
+    err "manifest parser not found at ${DEVX_PARSER}; ignoring manifest"
+    return 0
+  fi
+
+  DEVX_MF_FILE="$(mktemp)"
+  if ! python3 "${DEVX_PARSER}" < "${src}" > "${DEVX_MF_FILE}" 2>/dev/null; then
+    err "failed to parse $(basename "${src}"); ignoring manifest"
+    : > "${DEVX_MF_FILE}"
+  fi
+}
+
+# mf <key> -> value from manifest (empty if unset)
+mf() {
+  [[ -n "${DEVX_MF_FILE}" && -f "${DEVX_MF_FILE}" ]] || return 0
+  awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "${DEVX_MF_FILE}"
+}
+
+load_context() {
+  PROJECT_ROOT="$(find_project_root || true)"
+  if [[ -z "${PROJECT_ROOT:-}" ]]; then
+    err "run this command inside ~/workspace/work/<project> or ~/workspace/personal/<project>"
+    exit 1
+  fi
+
+  local parent
+  parent="$(dirname "${PROJECT_ROOT}")"
+  if [[ "${parent}" == "${workspace_root}/work" ]]; then
+    DEVX_WORKSPACE="work"
+  elif [[ "${parent}" == "${workspace_root}/personal" ]]; then
+    DEVX_WORKSPACE="personal"
+  else
+    err "unsupported workspace path: ${parent}"
+    exit 1
+  fi
+
+  DEVX_PROJECT_RAW="$(basename "${PROJECT_ROOT}")"
+  DEVX_PROJECT="$(sanitize_slug "${DEVX_PROJECT_RAW}")"
+  DEVX_COMPOSE_PROJECT="${DEVX_WORKSPACE}_${DEVX_PROJECT}"
+  DEVX_DOMAIN="${DEVX_PROJECT}.${DEVX_WORKSPACE}.test"
+  DEVX_DIR="${PROJECT_ROOT}/.devx"
+  DEVX_ENV_FILE="${DEVX_DIR}/.env"
+  DEVX_OVERRIDE_FILE="${DEVX_DIR}/compose.override.yml"
+  DEVX_GENERATED_FILE="${DEVX_DIR}/compose.generated.yml"
+  DEVX_GENERATED_DIR="${DEVX_DIR}/generated"
+  DEVX_PHP_DOCKERFILE="${DEVX_GENERATED_DIR}/php/Dockerfile"
+  DEVX_PHP_START_SCRIPT="${DEVX_GENERATED_DIR}/php/start.sh"
+  DEVX_NGINX_CONF="${DEVX_GENERATED_DIR}/nginx/default.conf"
+
+  if [[ -f "${PROJECT_ROOT}/docker-compose.yml" ]]; then
+    DEVX_BASE_COMPOSE="${PROJECT_ROOT}/docker-compose.yml"
+  elif [[ -f "${PROJECT_ROOT}/docker-compose.yaml" ]]; then
+    DEVX_BASE_COMPOSE="${PROJECT_ROOT}/docker-compose.yaml"
+  elif [[ -f "${PROJECT_ROOT}/compose.yml" ]]; then
+    DEVX_BASE_COMPOSE="${PROJECT_ROOT}/compose.yml"
+  elif [[ -f "${PROJECT_ROOT}/compose.yaml" ]]; then
+    DEVX_BASE_COMPOSE="${PROJECT_ROOT}/compose.yaml"
+  else
+    DEVX_BASE_COMPOSE=""
+  fi
+
+  parse_manifest
+}
+
+devx_env_value() {
+  local key="$1"
+  [[ -f "${DEVX_ENV_FILE}" ]] || return 1
+  awk -F= -v key="${key}" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "${DEVX_ENV_FILE}" | tr -d '\r'
+}
+
+parse_php_server_args() {
+  REQUESTED_PHP_SERVER=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --php-server=*)
+        REQUESTED_PHP_SERVER="${1#*=}"
+        ;;
+      --php-server)
+        shift
+        REQUESTED_PHP_SERVER="${1:-}"
+        ;;
+    esac
+    shift || true
+  done
+}
+
+determine_php_server() {
+  local value="${REQUESTED_PHP_SERVER:-}"
+  [[ -z "${value}" ]] && value="$(mf php_server)"
+  [[ -z "${value}" ]] && value="$(devx_env_value DEVX_PHP_SERVER || true)"
+  [[ -z "${value}" ]] && value="${DEVX_PHP_SERVER_DEFAULT:-nginx}"
+
+  case "${value}" in
+    apache|nginx)
+      DEVX_PHP_SERVER="${value}"
+      ;;
+    *)
+      err "unsupported PHP server '${value}'. use 'apache' or 'nginx'"
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Version detection (manifest wins, then project files, then fallback)
+# ---------------------------------------------------------------------------
+
+# Versi database boleh dipin per-project lewat .devx.yml:
+#
+#   postgres:
+#     version: "18"
+#
+# Tanpa itu, nilai lamanya dipakai — proyek lain tidak ikut berubah. Ini ada
+# karena beberapa proyek MEWAJIBKAN versi mayor tertentu (mis. sitms-core
+# butuh PostgreSQL 18) dan "kebetulan sama di laptop siapa" bukan jaminan.
+detect_postgres_version() {
+  local v; v="$(mf postgres_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  echo "16"
+}
+
+detect_mariadb_version() {
+  local v; v="$(mf mariadb_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  echo "11"
+}
+
+detect_node_version() {
+  local v; v="$(mf node_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  if [[ -f "${PROJECT_ROOT}/.nvmrc" ]]; then
+    tr -d 'v[:space:]' < "${PROJECT_ROOT}/.nvmrc"; return
+  fi
+  if [[ -f "${PROJECT_ROOT}/.node-version" ]]; then
+    tr -d 'v[:space:]' < "${PROJECT_ROOT}/.node-version"; return
+  fi
+  echo "22"
+}
+
+detect_php_version() {
+  local v; v="$(mf php_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  if [[ -f "${PROJECT_ROOT}/.php-version" ]]; then
+    tr -d '[:space:]' < "${PROJECT_ROOT}/.php-version"; return
+  fi
+  if [[ -f "${PROJECT_ROOT}/composer.json" ]]; then
+    local composer_platform_php composer_require_php
+    composer_platform_php="$(
+      tr -d '\n' < "${PROJECT_ROOT}/composer.json" \
+        | sed -n 's/.*"config"[[:space:]]*:[[:space:]]*{.*"platform"[[:space:]]*:[[:space:]]*{.*"php"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed -n '1p'
+    )"
+    if [[ -n "${composer_platform_php}" ]]; then
+      printf "%s" "${composer_platform_php}" | sed -E 's/^[^0-9]*([0-9]+\.[0-9]+).*/\1/'; return
+    fi
+    composer_require_php="$(sed -n '/"require"[[:space:]]*:/,/"require-dev"[[:space:]]*:/ s/.*"php"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${PROJECT_ROOT}/composer.json" | sed -n '1p' | tr -d '[:space:]')"
+    if [[ -n "${composer_require_php}" ]]; then
+      printf "%s" "${composer_require_php}" | sed -E 's/^[^0-9]*([0-9]+\.[0-9]+).*/\1/'; return
+    fi
+  fi
+  echo "8.3"
+}
+
+detect_python_version() {
+  local v; v="$(mf python_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  if [[ -f "${PROJECT_ROOT}/.python-version" ]]; then
+    tr -d '[:space:]' < "${PROJECT_ROOT}/.python-version"; return
+  fi
+  echo "3.12"
+}
+
+detect_ruby_version() {
+  local v; v="$(mf ruby_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  if [[ -f "${PROJECT_ROOT}/.ruby-version" ]]; then
+    tr -d '[:space:]' < "${PROJECT_ROOT}/.ruby-version"; return
+  fi
+  echo "3.3"
+}
+
+detect_go_version() {
+  local v; v="$(mf go_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
+  if [[ -f "${PROJECT_ROOT}/go.mod" ]]; then
+    awk '/^go / {print $2; exit}' "${PROJECT_ROOT}/go.mod"; return
+  fi
+  echo "1.22"
+}
+
+detect_package_manager() {
+  if [[ -f "${PROJECT_ROOT}/pnpm-lock.yaml" ]]; then
+    NODE_PM="pnpm"
+  elif [[ -f "${PROJECT_ROOT}/yarn.lock" ]]; then
+    NODE_PM="yarn"
+  elif [[ -f "${PROJECT_ROOT}/bun.lockb" || -f "${PROJECT_ROOT}/bun.lock" ]]; then
+    NODE_PM="bun"
+  else
+    NODE_PM="npm"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Framework detection
+# ---------------------------------------------------------------------------
+
+pkg_has_dep() {
+  # crude but effective: look for "name" key in package.json deps section
+  [[ -f "${PROJECT_ROOT}/package.json" ]] || return 1
+  rg -nq "\"$1\"[[:space:]]*:" "${PROJECT_ROOT}/package.json"
+}
+
+detect_node_framework() {
+  NODE_FRAMEWORK="$(mf node_framework)"
+  [[ -n "${NODE_FRAMEWORK}" ]] && return
+  if [[ -f "${PROJECT_ROOT}/ace" || -f "${PROJECT_ROOT}/.adonisrc.json" ]] || pkg_has_dep "@adonisjs/core"; then
+    NODE_FRAMEWORK="adonis"
+  elif [[ -f "${PROJECT_ROOT}/nest-cli.json" ]] || pkg_has_dep "@nestjs/core"; then
+    NODE_FRAMEWORK="nest"
+  elif ls "${PROJECT_ROOT}"/next.config.* >/dev/null 2>&1 || pkg_has_dep "next"; then
+    NODE_FRAMEWORK="next"
+  elif ls "${PROJECT_ROOT}"/nuxt.config.* >/dev/null 2>&1 || pkg_has_dep "nuxt"; then
+    NODE_FRAMEWORK="nuxt"
+  elif ls "${PROJECT_ROOT}"/vite.config.* >/dev/null 2>&1 || pkg_has_dep "vite"; then
+    NODE_FRAMEWORK="vite"
+  else
+    NODE_FRAMEWORK="generic"
+  fi
+}
+
+detect_python_framework() {
+  PY_FRAMEWORK="$(mf python_framework)"
+  [[ -n "${PY_FRAMEWORK}" ]] && return
+  if [[ -f "${PROJECT_ROOT}/manage.py" ]]; then
+    PY_FRAMEWORK="django"
+  elif rg --hidden -nq "fastapi" "${PROJECT_ROOT}/requirements.txt" "${PROJECT_ROOT}/pyproject.toml" 2>/dev/null; then
+    PY_FRAMEWORK="fastapi"
+  elif rg --hidden -nq "(^|[^a-z])flask" "${PROJECT_ROOT}/requirements.txt" "${PROJECT_ROOT}/pyproject.toml" 2>/dev/null; then
+    PY_FRAMEWORK="flask"
+  else
+    PY_FRAMEWORK="generic"
+  fi
+}
+
+detect_ruby_framework() {
+  RUBY_FRAMEWORK="$(mf ruby_framework)"
+  [[ -n "${RUBY_FRAMEWORK}" ]] && return
+  if [[ -f "${PROJECT_ROOT}/bin/rails" || -f "${PROJECT_ROOT}/config/application.rb" ]]; then
+    RUBY_FRAMEWORK="rails"
+  else
+    RUBY_FRAMEWORK="generic"
+  fi
+}
+
+composer_requires_extension() {
+  local ext_name="$1"
+  [[ -f "${PROJECT_ROOT}/composer.json" ]] || return 1
+  rg -nq "\"ext-${ext_name}\"\\s*:" "${PROJECT_ROOT}/composer.json"
+}
+
+env_value() {
+  local key="$1"
+  local file
+  for file in "${PROJECT_ROOT}/.env" "${PROJECT_ROOT}/.env.example" "${PROJECT_ROOT}/.env.dist"; do
+    if [[ -f "${file}" ]]; then
+      awk -F= -v key="${key}" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "${file}" | tr -d '\r'
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Stack + database detection
+# ---------------------------------------------------------------------------
+
+infer_main_db() {
+  local existing=""
+  existing="$(env_value DB_CONNECTION || true)"
+  existing="$(printf "%s" "${existing}" | tr -d '[:space:]\r')"
+  case "${existing}" in
+    mysql|mariadb) MAIN_DB="mysql"; return ;;
+    pgsql|postgres|postgresql) MAIN_DB="pgsql"; return ;;
+  esac
+  MAIN_DB=""
+}
+
+# ACTIVE_DBS: which database services to run (manifest wins, else auto)
+resolve_databases() {
+  ACTIVE_DBS=()
+  local mfdb d
+  mfdb="$(mf databases)"
+  if [[ -n "${mfdb}" ]]; then
+    for d in ${mfdb}; do
+      case "${d}" in
+        pgsql|postgresql|postgres) ACTIVE_DBS+=("postgres") ;;
+        mysql) ACTIVE_DBS+=("mysql") ;;
+        mariadb) ACTIVE_DBS+=("mariadb") ;;
+        redis) ACTIVE_DBS+=("redis") ;;
+      esac
+    done
+  else
+    case "${MAIN_DB}" in
+      mysql) ACTIVE_DBS+=("mysql") ;;
+      pgsql) ACTIVE_DBS+=("postgres") ;;
+    esac
+    if [[ -n "$(env_value REDIS_HOST || true)" || "$(env_value REDIS_CLIENT || true)" == "phpredis" || "$(env_value REDIS_CLIENT || true)" == "predis" ]]; then
+      ACTIVE_DBS+=("redis")
+    fi
+  fi
+
+  # derive flags + a sensible MAIN_DB if env didn't say
+  HAS_MYSQL=0; HAS_MARIADB=0; HAS_POSTGRES=0; HAS_REDIS=0
+  for d in ${ACTIVE_DBS[@]+"${ACTIVE_DBS[@]}"}; do
+    case "${d}" in
+      mysql) HAS_MYSQL=1 ;;
+      mariadb) HAS_MARIADB=1 ;;
+      postgres) HAS_POSTGRES=1 ;;
+      redis) HAS_REDIS=1 ;;
+    esac
+  done
+  if [[ -z "${MAIN_DB}" ]]; then
+    if [[ "${HAS_MYSQL}" == "1" || "${HAS_MARIADB}" == "1" ]]; then
+      MAIN_DB="mysql"
+    elif [[ "${HAS_POSTGRES}" == "1" ]]; then
+      MAIN_DB="pgsql"
+    fi
+  fi
+}
+
+has_db() {
+  local d
+  for d in ${ACTIVE_DBS[@]+"${ACTIVE_DBS[@]}"}; do
+    [[ "${d}" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+detect_stack() {
+  HAS_NODE=0; HAS_PHP=0; HAS_PYTHON=0; HAS_GO=0; HAS_RUBY=0; HAS_ELIXIR=0
+  IS_LARAVEL=0
+
+  [[ -f "${PROJECT_ROOT}/package.json" ]] && HAS_NODE=1
+  [[ -f "${PROJECT_ROOT}/composer.json" ]] && HAS_PHP=1
+  [[ -f "${PROJECT_ROOT}/pyproject.toml" || -f "${PROJECT_ROOT}/requirements.txt" || -f "${PROJECT_ROOT}/manage.py" ]] && HAS_PYTHON=1
+  [[ -f "${PROJECT_ROOT}/go.mod" ]] && HAS_GO=1
+  [[ -f "${PROJECT_ROOT}/Gemfile" ]] && HAS_RUBY=1
+  [[ -f "${PROJECT_ROOT}/mix.exs" ]] && HAS_ELIXIR=1
+  [[ -f "${PROJECT_ROOT}/artisan" && -d "${PROJECT_ROOT}/bootstrap" && -d "${PROJECT_ROOT}/config" ]] && IS_LARAVEL=1
+
+  detect_package_manager
+  [[ "${HAS_NODE}" == "1" ]] && detect_node_framework || NODE_FRAMEWORK=""
+  [[ "${HAS_PYTHON}" == "1" ]] && detect_python_framework || PY_FRAMEWORK=""
+  [[ "${HAS_RUBY}" == "1" ]] && detect_ruby_framework || RUBY_FRAMEWORK=""
+  infer_main_db
+  resolve_databases
+  determine_php_server
+  determine_web_entry
+}
+
+# ---------------------------------------------------------------------------
+# Per-stack runtime specs (service name / port / dev command)
+# ---------------------------------------------------------------------------
+
+php_docroot() {
+  local d; d="$(mf php_docroot)"
+  if [[ -n "${d}" ]]; then
+    [[ "${d}" == "." || "${d}" == "/" ]] && echo "" || echo "${d}"
+    return
+  fi
+  if [[ "${IS_LARAVEL}" == "1" || -d "${PROJECT_ROOT}/public" ]]; then
+    echo "public"
+  else
+    echo ""
+  fi
+}
+
+node_port() {
+  local p; p="$(mf node_port)"; [[ -n "${p}" ]] && { echo "${p}"; return; }
+  case "${NODE_FRAMEWORK}" in
+    adonis) echo "3333" ;;
+    nest|next|nuxt) echo "3000" ;;
+    *) echo "5173" ;;
+  esac
+}
+
+node_run_cmd() {
+  local c; c="$(mf node_command)"; [[ -n "${c}" ]] && { echo "${c}"; return; }
+  local pmrun port
+  port="$(node_port)"
+  case "${NODE_PM}" in
+    pnpm) pmrun="pnpm" ;;
+    yarn) pmrun="yarn" ;;
+    bun) pmrun="bun run" ;;
+    *) pmrun="npm run" ;;
+  esac
+  case "${NODE_FRAMEWORK}" in
+    adonis) echo "node ace serve --hmr" ;;
+    nest) echo "${pmrun} start:dev" ;;
+    next)
+      if [[ "${NODE_PM}" == "npm" ]]; then echo "npm run dev -- -H 0.0.0.0 -p ${port}"; else echo "${pmrun} dev -H 0.0.0.0 -p ${port}"; fi ;;
+    nuxt) echo "${pmrun} dev" ;;
+    vite|*)
+      if [[ "${NODE_PM}" == "npm" ]]; then echo "npm run dev -- --host 0.0.0.0 --port ${port}"; else echo "${pmrun} dev --host 0.0.0.0 --port ${port}"; fi ;;
+  esac
+}
+
+python_port() { local p; p="$(mf python_port)"; [[ -n "${p}" ]] && { echo "${p}"; return; }; echo "8000"; }
+go_port()     { local p; p="$(mf go_port)";     [[ -n "${p}" ]] && { echo "${p}"; return; }; echo "8080"; }
+ruby_port()   { local p; p="$(mf ruby_port)";   [[ -n "${p}" ]] && { echo "${p}"; return; }; echo "3000"; }
+
+python_run_cmd() {
+  local c; c="$(mf python_command)"; [[ -n "${c}" ]] && { echo "${c}"; return; }
+  case "${PY_FRAMEWORK}" in
+    django) echo "python manage.py runserver 0.0.0.0:$(python_port)" ;;
+    fastapi) echo "uvicorn main:app --host 0.0.0.0 --port $(python_port) --reload" ;;
+    flask) echo "flask run --host 0.0.0.0 --port $(python_port)" ;;
+    *) echo "" ;;
+  esac
+}
+
+ruby_run_cmd() {
+  local c; c="$(mf ruby_command)"; [[ -n "${c}" ]] && { echo "${c}"; return; }
+  case "${RUBY_FRAMEWORK}" in
+    rails) echo "bundle exec rails s -b 0.0.0.0 -p $(ruby_port)" ;;
+    *) echo "" ;;
+  esac
+}
+
+go_run_cmd() { mf go_command; }
+
+# The public web entry service (manifest wins, else priority on served stacks).
+determine_web_entry() {
+  local w; w="$(mf web)"
+  # web: none opts a project out of Caddy entirely — for CLI/script tools
+  # that never listen for HTTP, so they don't get a domain that 502s forever.
+  if [[ "${w}" == "none" ]]; then DEVX_WEB=""; return; fi
+  if [[ -n "${w}" ]]; then DEVX_WEB="${w}"; return; fi
+  if [[ "${HAS_PHP}" == "1" && "${IS_LARAVEL}" == "1" ]]; then DEVX_WEB="php"
+  elif [[ "${HAS_PYTHON}" == "1" && "${PY_FRAMEWORK}" == "django" ]]; then DEVX_WEB="python"
+  elif [[ "${HAS_RUBY}" == "1" && "${RUBY_FRAMEWORK}" == "rails" ]]; then DEVX_WEB="ruby"
+  elif [[ "${HAS_NODE}" == "1" && "${NODE_FRAMEWORK}" != "vite" && "${NODE_FRAMEWORK}" != "generic" ]]; then DEVX_WEB="node"
+  elif [[ "${HAS_GO}" == "1" ]]; then DEVX_WEB="go"
+  elif [[ "${HAS_RUBY}" == "1" ]]; then DEVX_WEB="ruby"
+  elif [[ "${HAS_PYTHON}" == "1" ]]; then DEVX_WEB="python"
+  elif [[ "${HAS_PHP}" == "1" ]]; then DEVX_WEB="php"
+  elif [[ "${HAS_NODE}" == "1" ]]; then DEVX_WEB="node"
+  else DEVX_WEB=""
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Global infra
+# ---------------------------------------------------------------------------
+
+ensure_global_up() {
+  require_docker
+  docker compose -p "${GLOBAL_PROJECT}" -f "${GLOBAL_COMPOSE}" up -d >/dev/null
+}
+
+global_down() {
+  require_docker
+  docker compose -p "${GLOBAL_PROJECT}" -f "${GLOBAL_COMPOSE}" down >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Project .env sync
+# ---------------------------------------------------------------------------
+
+ensure_app_env() {
+  local app_env="${PROJECT_ROOT}/.env"
+  [[ -f "${app_env}" ]] && return 0
+  if [[ -f "${PROJECT_ROOT}/.env.example" ]]; then cp "${PROJECT_ROOT}/.env.example" "${app_env}"; return 0; fi
+  if [[ -f "${PROJECT_ROOT}/.env.dist" ]]; then cp "${PROJECT_ROOT}/.env.dist" "${app_env}"; return 0; fi
+  : > "${app_env}"
+}
+
+write_project_env() {
+  mkdir -p "${DEVX_DIR}"
+  # Make <project>/.devx self-ignoring rather than editing the project's own
+  # .gitignore. Everything in here is machine-local generated state (ports,
+  # compose files, and now Python packages, which run to hundreds of MB), so
+  # it must never reach a commit.
+  [[ -f "${DEVX_DIR}/.gitignore" ]] || printf '*\n' > "${DEVX_DIR}/.gitignore"
+  # Upsert, never truncate: a full rewrite here would silently wipe
+  # DEVX_DB_PORT_* keys appended by db_port_for on a previous run, which
+  # defeats the entire point of locking those ports once. This ran on every
+  # `dev up`, so a port only "looked" stable when its default start value
+  # happened to still be free at reallocation time — real collisions (two
+  # projects both landing on the same freshly-reallocated port) were only a
+  # matter of timing away, and did happen.
+  [[ -f "${DEVX_ENV_FILE}" ]] || : > "${DEVX_ENV_FILE}"
+  upsert_env_key "${DEVX_ENV_FILE}" DEVX_WORKSPACE "${DEVX_WORKSPACE}"
+  upsert_env_key "${DEVX_ENV_FILE}" DEVX_PROJECT "${DEVX_PROJECT}"
+  upsert_env_key "${DEVX_ENV_FILE}" DEVX_DOMAIN "${DEVX_DOMAIN}"
+  upsert_env_key "${DEVX_ENV_FILE}" COMPOSE_PROJECT_NAME "${DEVX_COMPOSE_PROJECT}"
+  upsert_env_key "${DEVX_ENV_FILE}" DEVX_INGRESS_NETWORK "${INGRESS_NETWORK}"
+  upsert_env_key "${DEVX_ENV_FILE}" DEVX_PHP_SERVER "${DEVX_PHP_SERVER}"
+}
+
+upsert_env_key() {
+  local file="$1" key="$2" value="$3" tmp
+  tmp="$(mktemp)"
+  awk -v k="${key}" -v v="${value}" '
+    BEGIN { found=0 }
+    {
+      if ($0 ~ "^" k "=") { print k "=" v; found=1 }
+      else { print $0 }
+    }
+    END { if (!found) print k "=" v }
+  ' "${file}" > "${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+compose_declares_service() {
+  rg -nq "^[[:space:]]{2}$2:" "$1" 2>/dev/null
+}
+
+# Stable per-project host ports for published DB services.
+#
+# The published DB port is fixed once (here) and persisted rather than left
+# for Docker to assign fresh on every container start, so a GUI client's
+# saved connection never needs re-editing. Locking it in `.devx/.env` on
+# first use keeps the address stable for the lifetime of the project, same
+# shape as Sail's FORWARD_DB_PORT / DDEV's assigned port: chosen once,
+# persisted, reused.
+# True if some OTHER project's .devx/.env already claims this port. A pure
+# "is anything listening right now" check isn't enough: if that project's
+# stack happens to be stopped at allocation time, the port looks free even
+# though it's reserved, and two projects end up locking in the same port —
+# whichever container starts first wins the bind, the other silently fails
+# to publish (connection refused) or, worse, both look like they're up.
+port_reserved_elsewhere() {
+  local port="$1" f
+  for f in "${workspace_root}"/work/*/.devx/.env "${workspace_root}"/personal/*/.devx/.env; do
+    [[ -f "${f}" ]] || continue
+    [[ "${f}" -ef "${DEVX_ENV_FILE}" ]] && continue
+    awk -F= -v p="${port}" '$1 ~ /^DEVX_DB_PORT_/ && $2 == p { found=1 } END { exit !found }' "${f}" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+port_is_free() {
+  local port="$1"
+  nc -z 127.0.0.1 "${port}" >/dev/null 2>&1 && return 1
+  port_reserved_elsewhere "${port}" && return 1
+  return 0
+}
+
+allocate_db_port() {
+  local port="$1"
+  while ! port_is_free "${port}"; do port="$((port + 1))"; done
+  echo "${port}"
+}
+
+# db_port_for <compose-service-name> <default-start-port> -> stable host port
+db_port_for() {
+  local svc="$1" default_start="$2" key existing
+  key="DEVX_DB_PORT_$(printf '%s' "${svc}" | tr '[:lower:]' '[:upper:]')"
+  existing="$(devx_env_value "${key}" || true)"
+  if [[ -z "${existing}" ]]; then
+    existing="$(allocate_db_port "${default_start}")"
+  fi
+  upsert_env_key "${DEVX_ENV_FILE}" "${key}" "${existing}"
+  echo "${existing}"
+}
+
+project_db_host() {
+  if [[ -n "${DEVX_BASE_COMPOSE}" ]]; then
+    if compose_declares_service "${DEVX_BASE_COMPOSE}" "db"; then echo "db"; return; fi
+    if [[ "${MAIN_DB}" == "pgsql" ]] && compose_declares_service "${DEVX_BASE_COMPOSE}" "postgres"; then echo "postgres"; return; fi
+    if [[ "${MAIN_DB}" == "mysql" ]] && compose_declares_service "${DEVX_BASE_COMPOSE}" "mysql"; then echo "mysql"; return; fi
+  fi
+  case "${MAIN_DB}" in
+    pgsql) echo "postgres" ;;
+    mysql) [[ "${HAS_MARIADB}" == "1" && "${HAS_MYSQL}" != "1" ]] && echo "mariadb" || echo "mysql" ;;
+  esac
+}
+
+sync_project_env() {
+  local app_env="${PROJECT_ROOT}/.env" db_host
+  ensure_app_env
+  upsert_env_key "${app_env}" "APP_URL" "https://${DEVX_DOMAIN}"
+  upsert_env_key "${app_env}" "APP_DOMAIN" "${DEVX_DOMAIN}"
+  upsert_env_key "${app_env}" "ASSET_URL" "https://${DEVX_DOMAIN}"
+  upsert_env_key "${app_env}" "VITE_HMR_HOST" "${DEVX_DOMAIN}"
+  upsert_env_key "${app_env}" "VITE_DEV_ORIGIN" "https://${DEVX_DOMAIN}"
+  upsert_env_key "${app_env}" "VITE_DEV_HOST" "0.0.0.0"
+  upsert_env_key "${app_env}" "VITE_PORT" "5173"
+
+  # For projects that ship their own compose, do NOT touch DB/Redis creds —
+  # those are owned by the project's compose, and rewriting them clobbers
+  # custom values (e.g. database name slug mismatches).
+  if [[ -n "${DEVX_BASE_COMPOSE}" ]]; then
+    return 0
+  fi
+
+  if [[ "${HAS_REDIS}" == "1" ]]; then
+    upsert_env_key "${app_env}" "REDIS_HOST" "redis"
+    upsert_env_key "${app_env}" "REDIS_PORT" "6379"
+  fi
+
+  db_host="$(project_db_host)"
+  case "${MAIN_DB}" in
+    pgsql)
+      upsert_env_key "${app_env}" "DB_CONNECTION" "pgsql"
+      upsert_env_key "${app_env}" "DB_HOST" "${db_host}"
+      upsert_env_key "${app_env}" "DB_PORT" "5432"
+      upsert_env_key "${app_env}" "DB_DATABASE" "${DEVX_PROJECT}"
+      upsert_env_key "${app_env}" "DB_USERNAME" "postgres"
+      upsert_env_key "${app_env}" "DB_PASSWORD" "postgres"
+      ;;
+    mysql)
+      upsert_env_key "${app_env}" "DB_CONNECTION" "mysql"
+      upsert_env_key "${app_env}" "DB_HOST" "${db_host}"
+      upsert_env_key "${app_env}" "DB_PORT" "3306"
+      upsert_env_key "${app_env}" "DB_DATABASE" "${DEVX_PROJECT}"
+      upsert_env_key "${app_env}" "DB_USERNAME" "root"
+      upsert_env_key "${app_env}" "DB_PASSWORD" "root"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Generated PHP image assets
+# ---------------------------------------------------------------------------
+
+write_generated_php_assets() {
+  local php_version php_server docroot
+  php_version="$(detect_php_version)"
+  php_server="${DEVX_PHP_SERVER:-apache}"
+  docroot="$(php_docroot)"
+
+  local apt_packages php_extensions pecl_extensions
+  apt_packages=(git curl libonig-dev unzip zip libzip-dev libxml2-dev)
+  php_extensions=(mbstring xml opcache)
+  pecl_extensions=()
+
+  case "${MAIN_DB}" in
+    pgsql) apt_packages+=(libpq-dev); php_extensions+=(pdo_pgsql) ;;
+    mysql) php_extensions+=(pdo_mysql) ;;
+  esac
+
+  if [[ "${IS_LARAVEL}" == "1" ]] || composer_requires_extension "bcmath"; then php_extensions+=(bcmath); fi
+  if composer_requires_extension "intl"; then apt_packages+=(libicu-dev); php_extensions+=(intl); fi
+  if composer_requires_extension "gd"; then apt_packages+=(libpng-dev libjpeg62-turbo-dev libfreetype6-dev); php_extensions+=(gd); fi
+  if composer_requires_extension "exif"; then php_extensions+=(exif); fi
+  if composer_requires_extension "pcntl"; then php_extensions+=(pcntl); fi
+  if composer_requires_extension "zip"; then php_extensions+=(zip); fi
+  if [[ "$(env_value REDIS_CLIENT || true)" == "phpredis" ]] || composer_requires_extension "redis"; then pecl_extensions+=(redis); fi
+
+  mkdir -p "${DEVX_GENERATED_DIR}/php" "${DEVX_GENERATED_DIR}/nginx"
+
+  cat > "${DEVX_PHP_DOCKERFILE}" <<EOF
+# syntax=docker/dockerfile:1
+ARG PHP_VERSION=${php_version}
+FROM php:\${PHP_VERSION}-$( [[ "${php_server}" == "nginx" ]] && printf 'fpm' || printf 'apache' )
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \\
+    apt-get update && apt-get install -y \\
+$(printf '    %s \\\n' "${apt_packages[@]}")
+EOF
+
+  if printf '%s\n' "${php_extensions[@]}" | rg -qx 'gd'; then
+    cat >> "${DEVX_PHP_DOCKERFILE}" <<'EOF'
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+EOF
+  fi
+
+  cat >> "${DEVX_PHP_DOCKERFILE}" <<EOF
+    && docker-php-ext-install $(printf '%s ' "${php_extensions[@]}" | sed 's/ $//') \\
+EOF
+
+  if [[ "${#pecl_extensions[@]}" -gt 0 ]]; then
+    cat >> "${DEVX_PHP_DOCKERFILE}" <<EOF
+    && pecl install $(printf '%s ' "${pecl_extensions[@]}" | sed 's/ $//') \\
+    && docker-php-ext-enable $(printf '%s ' "${pecl_extensions[@]}" | sed 's/ $//') \\
+EOF
+  fi
+
+  if [[ "${php_server}" == "apache" && -n "${docroot}" ]]; then
+    cat >> "${DEVX_PHP_DOCKERFILE}" <<EOF
+    && a2enmod rewrite \\
+    && sed -ri -e 's!/var/www/html!/var/www/html/${docroot}!g' /etc/apache2/sites-available/*.conf \\
+    && sed -ri -e 's!/var/www/!/var/www/html/${docroot}!g' /etc/apache2/apache2.conf /etc/apache2/conf-available/*.conf
+EOF
+  elif [[ "${php_server}" == "apache" ]]; then
+    cat >> "${DEVX_PHP_DOCKERFILE}" <<'EOF'
+    && a2enmod rewrite
+EOF
+  else
+    cat >> "${DEVX_PHP_DOCKERFILE}" <<'EOF'
+    && true
+EOF
+  fi
+
+  # dev-friendly opcache (revalidate on every request)
+  cat >> "${DEVX_PHP_DOCKERFILE}" <<'EOF'
+RUN { \
+      echo 'opcache.enable=1'; \
+      echo 'opcache.validate_timestamps=1'; \
+      echo 'opcache.revalidate_freq=0'; \
+    } > /usr/local/etc/php/conf.d/devx-opcache.ini
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+COPY .devx/generated/php/start.sh /usr/local/bin/devx-php-start
+RUN chmod +x /usr/local/bin/devx-php-start
+
+WORKDIR /var/www/html
+CMD ["/usr/local/bin/devx-php-start"]
+EOF
+
+  cat > "${DEVX_PHP_START_SCRIPT}" <<'EOF'
+#!/usr/bin/env bash
+set -e
+cd /var/www/html
+if [[ -f composer.json && ! -f vendor/autoload.php ]]; then
+  echo "dev: PHP runtime is up, but Composer dependencies are not installed."
+  echo "dev: run 'dev composer install' when you're ready."
+fi
+if command -v apache2-foreground >/dev/null 2>&1; then
+  exec apache2-foreground
+fi
+exec php-fpm
+EOF
+
+  local nginx_root="/var/www/html"
+  [[ -n "${docroot}" ]] && nginx_root="/var/www/html/${docroot}"
+  cat > "${DEVX_NGINX_CONF}" <<EOF
+server {
+    listen 80;
+    server_name _;
+    root ${nginx_root};
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \\.php\$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_pass php:9000;
+        fastcgi_index index.php;
+    }
+
+    location ~* \\.(css|js|jpg|jpeg|gif|png|svg|ico|webp|woff|woff2|ttf)\$ {
+        access_log off;
+        expires 7d;
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Compose emission helpers
+# ---------------------------------------------------------------------------
+
+emit_caddy_main() {
+  # $1 = upstream port
+  printf '    labels:\n'
+  printf '      - caddy=${DEVX_DOMAIN}\n'
+  printf '      - caddy.tls=internal\n'
+  printf '      - caddy.reverse_proxy={{upstreams %s}}\n' "$1"
+}
+
+emit_caddy_sub() {
+  # $1 = subdomain label, $2 = upstream port
+  printf '    labels:\n'
+  printf '      - caddy=%s.${DEVX_DOMAIN}\n' "$1"
+  printf '      - caddy.tls=internal\n'
+  printf '      - caddy.reverse_proxy={{upstreams %s}}\n' "$2"
+}
+
+emit_caddy_vite() {
+  # Vite asset sidecar attaches to the main domain via a path matcher.
+  printf '    labels:\n'
+  printf '      - caddy=${DEVX_DOMAIN}\n'
+  printf '      - "caddy.@vite.path=/@vite/* /@id/* /resources/* /node_modules/* /vendor/*"\n'
+  printf '      - caddy.handle=@vite\n'
+  printf '      - caddy.handle.reverse_proxy={{upstreams 5173}}\n'
+}
+
+# Network topology
+# ----------------
+# devx_internal : private, per-project. Compose prefixes it with the project
+#                 name, so service aliases ("postgres", "redis", "php", ...)
+#                 stay unique per project. Every service joins this; all
+#                 inter-service DNS resolves here, unambiguously.
+# devx_ingress  : shared by ALL projects. ONLY services Caddy must reach join
+#                 it. Databases must never join: two projects both aliasing
+#                 "postgres" on a shared network makes Docker DNS round-robin
+#                 between them, silently routing queries to the wrong database.
+emit_networks_public() {   # service Caddy needs to reach
+  printf '    networks:\n      - devx_internal\n      - devx_ingress\n'
+}
+
+emit_networks_private() {  # internal-only (databases, php-fpm behind nginx)
+  printf '    networks:\n      - devx_internal\n'
+}
+
+emit_idle_wrapper() {
+  # $1 = human runtime label, $2 = install hint, $3 = run command (may be empty)
+  # If the command exits (e.g. deps not installed yet), the container stays up
+  # via tail so you can shell in and install manually.
+  local label="$1" hint="$2" cmd="$3"
+  if [[ -n "${cmd}" ]]; then
+    printf "    command: >-\n      sh -lc 'echo \"DevX %s runtime up.\"; %s || echo \"%s runtime exited — deps installed? try: %s\"; tail -f /dev/null'\n" "${label}" "${cmd}" "${label}" "${hint}"
+  else
+    printf "    command: >-\n      sh -lc 'echo \"DevX %s runtime up. Start it manually (e.g. %s).\"; tail -f /dev/null'\n" "${label}" "${hint}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Generate compose for projects without their own compose
+# ---------------------------------------------------------------------------
+
+write_generated_compose() {
+  local node_version php_version py_version go_version ruby_version php_server
+  node_version="$(detect_node_version)"
+  php_version="$(detect_php_version)"
+  py_version="$(detect_python_version)"
+  go_version="$(detect_go_version)"
+  ruby_version="$(detect_ruby_version)"
+  php_server="${DEVX_PHP_SERVER:-apache}"
+
+  [[ "${HAS_PHP}" == "1" ]] && write_generated_php_assets
+
+  local emitted_any=0
+
+  {
+    printf 'services:\n'
+
+    # ---- PHP --------------------------------------------------------------
+    if [[ "${HAS_PHP}" == "1" ]]; then
+      emitted_any=1
+      cat <<EOF
+  php:
+    build:
+      context: ${PROJECT_ROOT}
+      dockerfile: .devx/generated/php/Dockerfile
+      args:
+        PHP_VERSION: "${php_version}"
+    working_dir: /var/www/html
+    volumes:
+      - ${PROJECT_ROOT}:/var/www/html
+    environment:
+      APP_URL: https://\${DEVX_DOMAIN}
+      ASSET_URL: https://\${DEVX_DOMAIN}
+      VITE_HMR_HOST: \${DEVX_DOMAIN}
+      VITE_DEV_ORIGIN: https://\${DEVX_DOMAIN}
+EOF
+      if [[ "${php_server}" == "apache" ]]; then
+        if [[ "${DEVX_WEB}" == "php" ]]; then
+          emit_caddy_main 80; emit_networks_public
+        elif [[ -z "${DEVX_WEB}" ]]; then
+          emit_networks_private
+        else
+          emit_caddy_sub php 80; emit_networks_public
+        fi
+      else
+        # php-fpm sits behind nginx and is never reached by Caddy directly,
+        # so it stays off the shared ingress network.
+        emit_networks_private
+      fi
+
+      if [[ "${php_server}" == "nginx" ]]; then
+        cat <<EOF
+  web:
+    image: nginx:alpine
+    working_dir: /var/www/html
+    volumes:
+      - ${PROJECT_ROOT}:/var/www/html
+      - ${DEVX_NGINX_CONF}:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - php
+EOF
+        if [[ "${DEVX_WEB}" == "php" || "${DEVX_WEB}" == "web" ]]; then
+          emit_caddy_main 80; emit_networks_public
+        elif [[ -z "${DEVX_WEB}" ]]; then
+          emit_networks_private
+        else
+          emit_caddy_sub web 80; emit_networks_public
+        fi
+      fi
+    fi
+
+    # ---- Node -------------------------------------------------------------
+    if [[ "${HAS_NODE}" == "1" ]]; then
+      emitted_any=1
+      local nport ncmd
+      nport="$(node_port)"
+      ncmd="$(node_run_cmd)"
+      cat <<EOF
+  node:
+    image: node:${node_version}-alpine
+    working_dir: /workspace
+    volumes:
+      - ${PROJECT_ROOT}:/workspace
+    environment:
+      CHOKIDAR_USEPOLLING: "1"
+      WATCHPACK_POLLING: "true"
+      HOST: "0.0.0.0"
+      PORT: "${nport}"
+EOF
+      printf "    command: >-\n      sh -lc 'if [ ! -d node_modules ]; then echo \"DevX node up, deps not installed. Run: dev %s install\"; exec tail -f /dev/null; fi; exec %s'\n" "${NODE_PM}" "${ncmd}"
+      # Labeling: vite sidecar when PHP/web owns the domain, else main or sub.
+      if [[ "${DEVX_WEB}" == "node" ]]; then
+        emit_caddy_main "${nport}"; emit_networks_public
+      elif [[ "${NODE_FRAMEWORK}" == "vite" && ( "${DEVX_WEB}" == "php" || "${DEVX_WEB}" == "web" ) ]]; then
+        emit_caddy_vite; emit_networks_public
+      elif [[ -z "${DEVX_WEB}" ]]; then
+        emit_networks_private
+      else
+        emit_caddy_sub node "${nport}"; emit_networks_public
+      fi
+    fi
+
+    # ---- Python -----------------------------------------------------------
+    if [[ "${HAS_PYTHON}" == "1" ]]; then
+      emitted_any=1
+      local pport pcmd
+      pport="$(python_port)"
+      pcmd="$(python_run_cmd)"
+      cat <<EOF
+  python:
+    image: python:${py_version}-slim
+    working_dir: /workspace
+    volumes:
+      - ${PROJECT_ROOT}:/workspace
+    environment:
+      # Keep installed packages in the bind-mounted project dir instead of the
+      # container's own site-packages, which dies with the container: without
+      # this, \`dev down\` (or any recreate) silently wipes them and the next
+      # run fails with ModuleNotFoundError. Node (node_modules/) and PHP
+      # (vendor/) already persist this way by virtue of living in the project
+      # dir — this makes Python behave the same.
+      PYTHONUSERBASE: /workspace/.devx/python-packages
+      PIP_USER: "1"
+EOF
+      emit_idle_wrapper "Python" "pip install -r requirements.txt" "${pcmd}"
+      if [[ "${DEVX_WEB}" == "python" ]]; then
+        emit_caddy_main "${pport}"; emit_networks_public
+      elif [[ -z "${DEVX_WEB}" ]]; then
+        emit_networks_private
+      else
+        emit_caddy_sub python "${pport}"; emit_networks_public
+      fi
+    fi
+
+    # ---- Go ---------------------------------------------------------------
+    if [[ "${HAS_GO}" == "1" ]]; then
+      emitted_any=1
+      local gport gcmd
+      gport="$(go_port)"
+      gcmd="$(go_run_cmd)"
+      cat <<EOF
+  go:
+    image: golang:${go_version}
+    working_dir: /workspace
+    volumes:
+      - ${PROJECT_ROOT}:/workspace
+EOF
+      emit_idle_wrapper "Go" "go run ." "${gcmd}"
+      if [[ "${DEVX_WEB}" == "go" ]]; then
+        emit_caddy_main "${gport}"; emit_networks_public
+      elif [[ -z "${DEVX_WEB}" ]]; then
+        emit_networks_private
+      else
+        emit_caddy_sub go "${gport}"; emit_networks_public
+      fi
+    fi
+
+    # ---- Ruby -------------------------------------------------------------
+    if [[ "${HAS_RUBY}" == "1" ]]; then
+      emitted_any=1
+      local rport rcmd
+      rport="$(ruby_port)"
+      rcmd="$(ruby_run_cmd)"
+      cat <<EOF
+  ruby:
+    image: ruby:${ruby_version}
+    working_dir: /workspace
+    volumes:
+      - ${PROJECT_ROOT}:/workspace
+EOF
+      emit_idle_wrapper "Ruby" "bundle install" "${rcmd}"
+      if [[ "${DEVX_WEB}" == "ruby" ]]; then
+        emit_caddy_main "${rport}"; emit_networks_public
+      elif [[ -z "${DEVX_WEB}" ]]; then
+        emit_networks_private
+      else
+        emit_caddy_sub ruby "${rport}"; emit_networks_public
+      fi
+    fi
+
+    # ---- Elixir -----------------------------------------------------------
+    if [[ "${HAS_ELIXIR}" == "1" ]]; then
+      emitted_any=1
+      cat <<EOF
+  elixir:
+    image: elixir:1.17
+    working_dir: /workspace
+    volumes:
+      - ${PROJECT_ROOT}:/workspace
+EOF
+      emit_idle_wrapper "Elixir" "mix deps.get" ""
+      if [[ "${DEVX_WEB}" == "elixir" ]]; then
+        emit_caddy_main 4000; emit_networks_public
+      elif [[ -z "${DEVX_WEB}" ]]; then
+        emit_networks_private
+      else
+        emit_caddy_sub elixir 4000; emit_networks_public
+      fi
+    fi
+
+    # ---- Fallback placeholder --------------------------------------------
+    if [[ "${emitted_any}" == "0" ]]; then
+      cat <<'EOF'
+  app:
+    image: alpine:latest
+    command: sh -lc "sleep infinity"
+    labels:
+      - caddy=${DEVX_DOMAIN}
+      - caddy.tls=internal
+      - caddy.respond="Project initialized. Add app stack files and re-run dev init."
+    networks:
+      - devx_internal
+      - devx_ingress
+EOF
+    fi
+
+    # ---- Databases --------------------------------------------------------
+    if has_db mysql; then
+      local mysql_port; mysql_port="$(db_port_for mysql 3307)"
+      cat <<EOF
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: ${DEVX_PROJECT}
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - ${DEVX_COMPOSE_PROJECT}_mysql_data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:${mysql_port}:3306"
+    networks:
+      - devx_internal
+EOF
+    fi
+    if has_db mariadb; then
+      local mariadb_port; mariadb_port="$(db_port_for mariadb 3317)"
+      local mariadb_version; mariadb_version="$(detect_mariadb_version)"
+      cat <<EOF
+  mariadb:
+    image: mariadb:${mariadb_version}
+    environment:
+      MARIADB_DATABASE: ${DEVX_PROJECT}
+      MARIADB_ROOT_PASSWORD: root
+    volumes:
+      - ${DEVX_COMPOSE_PROJECT}_mariadb_data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:${mariadb_port}:3306"
+    networks:
+      - devx_internal
+EOF
+    fi
+    if has_db postgres; then
+      local postgres_port postgres_version postgres_data_path
+      postgres_port="$(db_port_for postgres 5433)"
+      postgres_version="$(detect_postgres_version)"
+      # Image resmi PostgreSQL 18+ memindahkan data ke subdirektori ber-versi
+      # (/var/lib/postgresql/<major>/docker) dan MENOLAK start kalau volume
+      # masih dipasang di /var/lib/postgresql/data gaya lama. Jadi titik mount
+      # ikut versi, bukan dipukul rata.
+      if [[ "${postgres_version%%.*}" -ge 18 ]]; then
+        postgres_data_path="/var/lib/postgresql"
+      else
+        postgres_data_path="/var/lib/postgresql/data"
+      fi
+      cat <<EOF
+  postgres:
+    image: postgres:${postgres_version}-alpine
+    environment:
+      POSTGRES_DB: ${DEVX_PROJECT}
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    volumes:
+      - ${DEVX_COMPOSE_PROJECT}_postgres_data:${postgres_data_path}
+    ports:
+      - "127.0.0.1:${postgres_port}:5432"
+    networks:
+      - devx_internal
+EOF
+    fi
+    if has_db redis; then
+      local redis_port; redis_port="$(db_port_for redis 6380)"
+      cat <<EOF
+  redis:
+    image: redis:alpine
+    ports:
+      - "127.0.0.1:${redis_port}:6379"
+    networks:
+      - devx_internal
+EOF
+    fi
+
+    # ---- Networks + volumes ----------------------------------------------
+    cat <<'EOF'
+networks:
+  devx_internal:
+  devx_ingress:
+    external: true
+    name: ${DEVX_INGRESS_NETWORK}
+EOF
+
+    if has_db mysql || has_db mariadb || has_db postgres; then
+      printf 'volumes:\n'
+      if has_db mysql; then printf '  %s_mysql_data:\n' "${DEVX_COMPOSE_PROJECT}"; fi
+      if has_db mariadb; then printf '  %s_mariadb_data:\n' "${DEVX_COMPOSE_PROJECT}"; fi
+      if has_db postgres; then printf '  %s_postgres_data:\n' "${DEVX_COMPOSE_PROJECT}"; fi
+    fi
+  } > "${DEVX_GENERATED_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Override for projects that ship their own compose
+# ---------------------------------------------------------------------------
+
+write_override_for_existing_compose() {
+  local services expose_svc has_web_and_app
+  services="$(docker compose -f "${DEVX_BASE_COMPOSE}" config --services 2>/dev/null || true)"
+  expose_svc=""
+  has_web_and_app=0
+
+  for candidate in web app frontend api; do
+    if echo "${services}" | rg -qx "${candidate}"; then expose_svc="${candidate}"; break; fi
+  done
+  if echo "${services}" | rg -qx "web" && echo "${services}" | rg -qx "app"; then has_web_and_app=1; fi
+
+  printf 'services:\n' > "${DEVX_OVERRIDE_FILE}"
+
+  # Only app-tier services are attached to the shared ingress network.
+  # Databases are deliberately excluded: they keep whatever private network the
+  # project's own compose gives them. Attaching them to the shared network makes
+  # aliases like "postgres"/"redis"/"db" ambiguous across projects, and Docker
+  # DNS then round-robins queries into another project's database.
+  for svc in app web api frontend backend node; do
+    if echo "${services}" | rg -qx "${svc}"; then
+      if [[ "${svc}" == "${expose_svc}" ]]; then
+        cat >> "${DEVX_OVERRIDE_FILE}" <<EOF
+  ${svc}:
+    networks:
+      - devx_ingress
+    labels:
+      - caddy=\${DEVX_DOMAIN}
+      - caddy.tls=internal
+      - caddy.reverse_proxy={{upstreams 80}}
+EOF
+      else
+        cat >> "${DEVX_OVERRIDE_FILE}" <<EOF
+  ${svc}:
+    networks:
+      - devx_ingress
+EOF
+      fi
+
+      if [[ "${svc}" == "app" && "${has_web_and_app}" == "1" ]]; then
+        cat >> "${DEVX_OVERRIDE_FILE}" <<EOF
+    labels:
+      - caddy=\${DEVX_DOMAIN}
+      - "caddy.@vite.path=/@vite/* /@id/* /resources/* /node_modules/* /vendor/*"
+      - caddy.handle=@vite
+      - caddy.handle.reverse_proxy={{upstreams 5173}}
+EOF
+      fi
+    fi
+  done
+
+  # Databases get a host port published (Docker picks a free one, bound to
+  # 127.0.0.1) so tools like DBeaver can reach them — but no network change,
+  # so they stay off devx_ingress. Compose merges `ports:` across files by
+  # concatenation, so this only adds to whatever the project's own compose
+  # already declares.
+  for svc in mysql mariadb postgres db redis; do
+    if echo "${services}" | rg -qx "${svc}"; then
+      local container_port="" default_start="" host_port
+      case "${svc}" in
+        mysql) container_port="3306"; default_start="3307" ;;
+        mariadb) container_port="3306"; default_start="3317" ;;
+        postgres) container_port="5432"; default_start="5433" ;;
+        redis) container_port="6379"; default_start="6380" ;;
+        db)
+          if [[ "${MAIN_DB:-}" == "pgsql" ]]; then container_port="5432"; default_start="5433"
+          else container_port="3306"; default_start="3307"
+          fi
+          ;;
+      esac
+      host_port="$(db_port_for "${svc}" "${default_start}")"
+      cat >> "${DEVX_OVERRIDE_FILE}" <<EOF
+  ${svc}:
+    ports:
+      - "127.0.0.1:${host_port}:${container_port}"
+EOF
+    fi
+  done
+
+  cat >> "${DEVX_OVERRIDE_FILE}" <<'EOF'
+networks:
+  devx_ingress:
+    external: true
+    name: ${DEVX_INGRESS_NETWORK}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Compose plumbing
+# ---------------------------------------------------------------------------
+
+set_compose_files() {
+  DEVX_COMPOSE_FILES=()
+  if [[ -n "${DEVX_BASE_COMPOSE}" ]]; then
+    DEVX_COMPOSE_FILES+=("-f" "${DEVX_BASE_COMPOSE}" "-f" "${DEVX_OVERRIDE_FILE}")
+  else
+    DEVX_COMPOSE_FILES+=("-f" "${DEVX_GENERATED_FILE}")
+  fi
+}
+
+dc() {
+  set_compose_files
+  docker compose --env-file "${DEVX_ENV_FILE}" -p "${DEVX_COMPOSE_PROJECT}" "${DEVX_COMPOSE_FILES[@]}" "$@"
+}
+
+service_running() {
+  local cid
+  cid="$(dc ps -q "$1" 2>/dev/null | sed -n '1p')"
+  [[ -n "${cid}" ]] || return 1
+  [[ "$(docker inspect -f '{{.State.Running}}' "${cid}" 2>/dev/null)" == "true" ]]
+}
+
+# Exec into a service, starting it first if it isn't up.
+#
+# Runtime commands (dev python/npm/artisan/...) are the *only* entry point for
+# CLI-only projects — there's no long-running server, so requiring a separate
+# `dev up` first just produces docker's unhelpful `service "x" is not running`.
+# Starting a container is infra, which dev owns; installing deps inside it
+# stays manual, so this doesn't cross the tool's line.
+dcx() {
+  local svc="$1"; shift
+  if ! service_running "${svc}"; then
+    echo "dev: starting '${svc}'…" >&2
+    ensure_global_up
+    compose_up "${svc}" >/dev/null
+  fi
+  dc exec "${svc}" "$@"
+}
+
+compose_scan_file() {
+  if [[ -n "${DEVX_BASE_COMPOSE}" ]]; then echo "${DEVX_BASE_COMPOSE}"; else echo "${DEVX_GENERATED_FILE}"; fi
+}
+
+compose_services() {
+  if [[ -z "${_COMPOSE_SERVICES_CACHE}" ]]; then
+    _COMPOSE_SERVICES_CACHE="$(dc config --services 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${_COMPOSE_SERVICES_CACHE}"
+}
+
+compose_has_service() {
+  compose_services | rg -qx "$1"
+}
+
+build_profiles() {
+  PROFILE_ARGS=()
+  local scan p
+  scan="$(compose_scan_file)"
+  for p in mysql mariadb postgres redis; do
+    if rg -nq "profiles:.*\b${p}\b" "${scan}" 2>/dev/null; then PROFILE_ARGS+=("--profile" "${p}"); fi
+  done
+}
+
+compose_up() {
+  build_profiles
+  dc ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d --remove-orphans "$@"
+}
+
+compose_up_build() {
+  build_profiles
+  dc ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d --build --remove-orphans "$@"
+}
+
+compose_down() {
+  build_profiles
+  dc ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} down --remove-orphans
+}
+
+# ---------------------------------------------------------------------------
+# Service resolution for runtime commands
+# ---------------------------------------------------------------------------
+
+resolve_service_by_names() {
+  local svc
+  for svc in "$@"; do
+    if compose_has_service "${svc}"; then echo "${svc}"; return 0; fi
+  done
+  return 1
+}
+
+resolve_app_service()    { resolve_service_by_names php app node python go ruby web frontend backend api || compose_services | head -n1; }
+resolve_php_service()    { resolve_service_by_names php app backend api || { err "no PHP-capable service found"; exit 1; }; }
+resolve_js_service()     { resolve_service_by_names node app web frontend || { err "no JavaScript-capable service found"; exit 1; }; }
+resolve_python_service() { resolve_service_by_names python app backend api || { err "no Python-capable service found"; exit 1; }; }
+resolve_go_service()     { resolve_service_by_names go app backend api || { err "no Go-capable service found"; exit 1; }; }
+resolve_ruby_service()   { resolve_service_by_names ruby app backend api || { err "no Ruby-capable service found"; exit 1; }; }
+
+# ---------------------------------------------------------------------------
+# DB proxy for host tools (DBeaver, etc.)
+# ---------------------------------------------------------------------------
+
+resolve_db_service() {
+  local scan; scan="$(compose_scan_file)"
+  if [[ "${HAS_POSTGRES:-0}" == "1" ]] && rg -nq '^[[:space:]]{2}postgres:' "${scan}" 2>/dev/null; then echo "postgres"; return 0; fi
+  if [[ "${HAS_MARIADB:-0}" == "1" ]] && rg -nq '^[[:space:]]{2}mariadb:' "${scan}" 2>/dev/null; then echo "mariadb"; return 0; fi
+  if [[ "${HAS_MYSQL:-0}" == "1" ]] && rg -nq '^[[:space:]]{2}mysql:' "${scan}" 2>/dev/null; then echo "mysql"; return 0; fi
+  if rg -nq '^[[:space:]]{2}db:' "${scan}" 2>/dev/null; then echo "db"; return 0; fi
+  return 1
+}
+
+db_engine_for_service() {
+  case "$1" in
+    postgres) echo "postgres" ;;
+    mariadb) echo "mysql" ;;
+    mysql) echo "mysql" ;;
+    db) [[ "${MAIN_DB:-}" == "pgsql" ]] && echo "postgres" || echo "mysql" ;;
+    *) echo "" ;;
+  esac
+}
+
+db_credentials_from_env() {
+  local app_env="${PROJECT_ROOT}/.env" database username password
+  database="$(awk -F= '$1=="DB_DATABASE"{print $2; exit}' "${app_env}" 2>/dev/null | tr -d '\r')"
+  username="$(awk -F= '$1=="DB_USERNAME"{print $2; exit}' "${app_env}" 2>/dev/null | tr -d '\r')"
+  password="$(awk -F= '$1=="DB_PASSWORD"{print $2; exit}' "${app_env}" 2>/dev/null | tr -d '\r')"
+  echo "${database}|${username}|${password}"
+}
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+prepare_project_config() {
+  detect_stack
+  write_project_env
+  sync_project_env
+  if [[ -n "${DEVX_BASE_COMPOSE}" ]]; then
+    write_override_for_existing_compose
+  else
+    write_generated_compose
+  fi
+  _COMPOSE_SERVICES_CACHE=""
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+ensure_inited() { [[ -f "${DEVX_ENV_FILE}" ]] || cmd_init; }
+
+cmd_init() {
+  need_cmd rg
+  load_context
+  parse_php_server_args "$@"
+  prepare_project_config
+  echo "Initialized: ${DEVX_COMPOSE_PROJECT}"
+  if [[ -n "${DEVX_WEB}" ]]; then
+    echo "Domain: https://${DEVX_DOMAIN}"
+    echo "Web entry: ${DEVX_WEB}"
+  else
+    echo "No web entry (web: none) — not exposed via Caddy, no domain."
+  fi
+  if [[ "${HAS_PHP}" == "1" && -z "${DEVX_BASE_COMPOSE}" ]]; then echo "PHP server: ${DEVX_PHP_SERVER}"; fi
+  if [[ "${#ACTIVE_DBS[@]}" -gt 0 ]]; then echo "Databases: ${ACTIVE_DBS[*]}"; fi
+}
+
+# Scaffold a brand-new project folder and bring it up. Unlike `gclone` (a
+# shell function in .zshrc), `dev` itself is a plain executable — it cannot
+# `cd` the caller's interactive shell, so this prints the path instead.
+cmd_new() {
+  local group="work" name="" up_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --personal) group="personal" ;;
+      --php-server=*) up_args+=("$1") ;;
+      --php-server) up_args+=("$1" "${2:-}"); shift ;;
+      -*) err "unknown flag: $1"; exit 1 ;;
+      *) name="$1" ;;
+    esac
+    shift || true
+  done
+  if [[ -z "${name}" ]]; then
+    err "usage: dev new [--personal] <name> [--php-server=apache|nginx]"
+    exit 1
+  fi
+
+  local slug; slug="$(sanitize_slug "${name}")"
+  [[ -n "${slug}" ]] || { err "invalid project name: ${name}"; exit 1; }
+
+  local target="${workspace_root}/${group}/${slug}"
+  [[ -e "${target}" ]] && { err "already exists: ${target}"; exit 1; }
+
+  mkdir -p "${target}"
+  git init -q "${target}"
+
+  local up_status=0
+  ( cd "${target}" && main up "${up_args[@]}" ) || up_status=$?
+  echo "Created: ${target}"
+  echo "cd ${target}"
+  if [[ "${up_status}" -ne 0 ]]; then
+    err "'dev up' failed above — fix the issue, then: cd ${target} && dev up"
+    exit "${up_status}"
+  fi
+}
+
+cmd_up() {
+  load_context
+  parse_php_server_args "$@"
+  prepare_project_config
+  require_docker
+  ensure_global_up
+  compose_up_build
+  echo "Up: ${DEVX_COMPOSE_PROJECT}"
+  if [[ -n "${DEVX_WEB}" ]]; then
+    echo "Open: https://${DEVX_DOMAIN}"
+  fi
+}
+
+cmd_down() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+  compose_down
+  if [[ "${1:-}" == "--global" ]]; then global_down; fi
+  echo "Down: ${DEVX_COMPOSE_PROJECT}"
+}
+
+cmd_restart() {
+  load_context
+  parse_php_server_args "$@"
+  prepare_project_config
+  require_docker
+  compose_down
+  ensure_global_up
+  compose_up_build
+  echo "Restarted: ${DEVX_COMPOSE_PROJECT}"
+  echo "Open: https://${DEVX_DOMAIN}"
+}
+
+cmd_rebuild() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+  ensure_global_up
+  compose_up_build
+  echo "Rebuilt: ${DEVX_COMPOSE_PROJECT}"
+}
+
+cmd_ps() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+  dc ps
+}
+
+cmd_logs() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+  dc logs "${@:1}"
+}
+
+cmd_shell() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+  dcx "$(resolve_app_service)" sh
+}
+
+cmd_exec() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+  local svc="${1:-}"
+  if [[ -z "${svc}" ]]; then err "usage: dev exec <service> <command...>"; exit 1; fi
+  shift
+  dcx "${svc}" "$@"
+}
+
+cmd_npm() {
+  load_context; ensure_inited; detect_stack; require_docker
+  local svc; svc="$(resolve_js_service)"
+  if [[ "${1:-}" == "run" && "${2:-}" == "dev" ]] && service_running "${svc}"; then
+    if dc exec "${svc}" sh -lc "node -e \"const net=require('net');const s=net.connect(5173,'127.0.0.1',()=>process.exit(0));s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),400);\"" >/dev/null 2>&1; then
+      echo "dev: a dev server already appears to be running in '${svc}'."
+      return 0
+    fi
+  fi
+  dcx "${svc}" npm "$@"
+}
+
+cmd_npx()      { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_js_service)" npx "$@"; }
+cmd_node()     { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_js_service)" node "$@"; }
+cmd_pnpm()     { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_js_service)" sh -lc 'export npm_config_store_dir="$HOME/.pnpm-store"; if ! pnpm -v >/dev/null 2>&1; then export COREPACK_DEFAULT_TO_LATEST=0; corepack enable >/dev/null 2>&1 || true; fi; if ! pnpm -v >/dev/null 2>&1; then corepack disable >/dev/null 2>&1 || true; echo "dev: bootstrapping pnpm@9 (corepack default incompatible with this node)" >&2; npm i -g pnpm@9 >/dev/null 2>&1 || true; fi; exec pnpm "$@"' sh "$@"; }
+cmd_yarn()     { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_js_service)" sh -lc 'if ! yarn -v >/dev/null 2>&1; then export COREPACK_DEFAULT_TO_LATEST=0; corepack enable >/dev/null 2>&1 || true; fi; if ! yarn -v >/dev/null 2>&1; then corepack disable >/dev/null 2>&1 || true; echo "dev: bootstrapping yarn" >&2; npm i -g yarn >/dev/null 2>&1 || true; fi; exec yarn "$@"' sh "$@"; }
+cmd_bun()      { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_js_service)" bun "$@"; }
+
+cmd_php()      { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_php_service)" php "$@"; }
+cmd_artisan()  { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_php_service)" php artisan "$@"; }
+cmd_composer() { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_php_service)" composer "$@"; }
+
+cmd_python()   { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_python_service)" python "$@"; }
+cmd_pip()      { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_python_service)" pip "$@"; }
+cmd_go()       { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_go_service)" go "$@"; }
+cmd_ruby()     { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_ruby_service)" ruby "$@"; }
+cmd_bundle()   { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_ruby_service)" bundle "$@"; }
+cmd_rails()    { load_context; ensure_inited; detect_stack; require_docker; dcx "$(resolve_ruby_service)" bundle exec rails "$@"; }
+
+cmd_db() {
+  load_context
+  ensure_inited
+  detect_stack
+  require_docker
+
+  local action="${1:-info}"; shift || true
+  local svc engine default_start host_port creds database username password
+  svc="$(resolve_db_service || true)"
+  if [[ -z "${svc}" ]]; then err "no database service found for this project"; exit 1; fi
+  engine="$(db_engine_for_service "${svc}")"
+  case "${svc}" in
+    mysql) default_start="3307" ;;
+    mariadb) default_start="3317" ;;
+    postgres) default_start="5433" ;;
+    db) [[ "${engine}" == "postgres" ]] && default_start="5433" || default_start="3307" ;;
+  esac
+
+  case "${action}" in
+    info|proxy|open)
+      # The DB port is published directly in compose and fixed once per
+      # project in .devx/.env (see db_port_for) — "making it reachable" is
+      # just making sure the service container is up. No separate proxy
+      # container, nothing to go stale.
+      ensure_global_up
+      compose_up "${svc}" >/dev/null
+      host_port="$(db_port_for "${svc}" "${default_start}")"
+      creds="$(db_credentials_from_env "${engine}")"
+      database="${creds%%|*}"; creds="${creds#*|}"; username="${creds%%|*}"; password="${creds#*|}"
+      echo "Engine: ${engine}"; echo "Service: ${svc}"; echo "Host: 127.0.0.1"
+      echo "Port: ${host_port}"; echo "Database: ${database}"
+      echo "Username: ${username}"; echo "Password: ${password}"
+      if [[ "${HAS_REDIS:-0}" == "1" ]] && compose_has_service redis; then
+        local redis_port
+        redis_port="$(db_port_for redis 6380)"
+        echo "Redis: 127.0.0.1:${redis_port}"
+      fi
+      ;;
+    stop)
+      echo "dev: nothing to stop — the DB port is published by the service itself."
+      echo "dev: it closes automatically on 'dev down'. Use that instead."
+      ;;
+    *)
+      err "unknown db action: ${action}. use: info | stop"; exit 1 ;;
+  esac
+}
+
+cmd_open() {
+  load_context
+  detect_stack
+  if [[ -z "${DEVX_WEB}" ]]; then
+    err "no web entry for this project (web: none) — nothing to open"
+    exit 1
+  fi
+  local url="https://${DEVX_DOMAIN}"
+  echo "${url}"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "${url}" >/dev/null 2>&1 || true
+  elif command -v open >/dev/null 2>&1; then
+    open "${url}" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_doctor() {
+  load_context
+  detect_stack
+  echo "Project: ${DEVX_PROJECT}"
+  echo "Workspace: ${DEVX_WORKSPACE}"
+  echo "Compose project: ${DEVX_COMPOSE_PROJECT}"
+  echo "Domain: ${DEVX_DOMAIN}"
+  echo "Web entry: ${DEVX_WEB:-none}"
+  echo "Compose source: $([[ -n "${DEVX_BASE_COMPOSE}" ]] && echo "own (${DEVX_BASE_COMPOSE##*/})" || echo generated)"
+  echo "Detected stack: php=${HAS_PHP} node=${HAS_NODE} python=${HAS_PYTHON} go=${HAS_GO} ruby=${HAS_RUBY} elixir=${HAS_ELIXIR}"
+  echo "Frameworks: node=${NODE_FRAMEWORK:-} python=${PY_FRAMEWORK:-} ruby=${RUBY_FRAMEWORK:-} laravel=${IS_LARAVEL}"
+  echo "Databases: ${ACTIVE_DBS[*]:-none}"
+  [[ "${HAS_PHP}" == "1" ]] && echo "PHP server: ${DEVX_PHP_SERVER}"
+  echo "Package manager: ${NODE_PM}"
+  [[ -n "${DEVX_MF_FILE}" && -s "${DEVX_MF_FILE}" ]] && echo "Manifest: .devx.yml (active)" || echo "Manifest: none"
+
+  if [[ "${DEVX_OS}" == "Darwin" ]]; then
+    if [[ -f /etc/resolver/test ]] && rg -q '127\.0\.0\.1' /etc/resolver/test 2>/dev/null; then
+      echo "Resolver (*.test): OK"
+    else
+      echo "Resolver (*.test): MISSING — run: sudo mkdir -p /etc/resolver && echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test"
+    fi
+  elif command -v resolvectl >/dev/null 2>&1 && resolvectl query "devx-doctor-check.test" >/dev/null 2>&1; then
+    echo "Resolver (*.test): OK"
+  elif command -v resolvectl >/dev/null 2>&1; then
+    echo "Resolver (*.test): MISSING — check /etc/systemd/resolved.conf.d/devx-test-tld.conf routes .test to 127.0.0.1, then: sudo systemctl restart systemd-resolved"
+  else
+    echo "Resolver (*.test): UNKNOWN — no systemd-resolved detected (WSL2 without systemd?). See SETUP.md for a hosts-file-based fallback."
+  fi
+
+  if docker_ok; then
+    echo "Docker: OK"
+    if docker network inspect "${INGRESS_NETWORK}" >/dev/null 2>&1; then
+      echo "Ingress network: ${INGRESS_NETWORK} (present)"
+    else
+      echo "Ingress network: ${INGRESS_NETWORK} (missing, created on dev up)"
+    fi
+    if docker volume inspect devx-global_devx_caddy_data >/dev/null 2>&1; then
+      echo "Caddy CA: present (run 'dev trust' to install in the system + browser trust stores)"
+    else
+      echo "Caddy CA: not yet created (start a project with 'dev up' first)"
+    fi
+  else
+    echo "Docker: OFFLINE"
+  fi
+}
+
+cmd_trust() {
+  require_docker
+  local cert_out="${DEVX_HOME}/devx-local-rootCA.crt"
+  docker run --rm -v devx-global_devx_caddy_data:/data alpine sh -lc \
+    'cat /data/caddy/pki/authorities/local/root.crt' > "${cert_out}"
+
+  echo "Installing trust certificate system-wide (sudo required)..."
+  if [[ "${DEVX_OS}" == "Darwin" ]]; then
+    # Covers Safari + Chrome on macOS (both read the System keychain directly).
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${cert_out}"
+    echo "System trust store (Keychain): OK"
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    # Fedora / RHEL / CentOS family
+    sudo cp "${cert_out}" /etc/pki/ca-trust/source/anchors/devx-local-rootCA.crt
+    sudo update-ca-trust extract
+    echo "System trust store: OK"
+  elif command -v update-ca-certificates >/dev/null 2>&1; then
+    # Debian / Ubuntu family
+    sudo cp "${cert_out}" /usr/local/share/ca-certificates/devx-local-rootCA.crt
+    sudo update-ca-certificates
+    echo "System trust store: OK"
+  else
+    echo "No known system trust-store command found (update-ca-trust / update-ca-certificates / security)."
+    echo "Install the cert manually: ${cert_out}"
+  fi
+
+  # Chrome/Chromium on Linux read ~/.pki/nssdb directly; on macOS they read the
+  # System keychain (already handled above), so this NSS step is Linux-only.
+  if [[ "${DEVX_OS}" != "Darwin" ]] && command -v certutil >/dev/null 2>&1; then
+    mkdir -p "${HOME}/.pki/nssdb"
+    [[ -f "${HOME}/.pki/nssdb/cert9.db" ]] || certutil -N -d "sql:${HOME}/.pki/nssdb" --empty-password
+    certutil -D -d "sql:${HOME}/.pki/nssdb" -n "DevX Local CA" >/dev/null 2>&1 || true
+    certutil -A -d "sql:${HOME}/.pki/nssdb" -t "C,," -n "DevX Local CA" -i "${cert_out}"
+    echo "Browser trust store (Chrome/Chromium via ~/.pki/nssdb): OK"
+  elif [[ "${DEVX_OS}" != "Darwin" ]]; then
+    echo "certutil not found (Fedora: sudo dnf install nss-tools · Debian/Ubuntu: sudo apt install libnss3-tools) — skipped Chrome/Chromium NSS trust store."
+  fi
+
+  # Firefox keeps its own NSS profile on every OS, independent of the system
+  # trust store — always needs certutil regardless of platform.
+  if command -v certutil >/dev/null 2>&1; then
+    local ff_glob="${HOME}/.mozilla/firefox/*.default*"
+    [[ "${DEVX_OS}" == "Darwin" ]] && ff_glob="${HOME}/Library/Application Support/Firefox/Profiles/*.default*"
+    local profile found_ff=0
+    for profile in ${ff_glob}; do
+      [[ -d "${profile}" ]] || continue
+      found_ff=1
+      certutil -D -d "sql:${profile}" -n "DevX Local CA" >/dev/null 2>&1 || true
+      certutil -A -d "sql:${profile}" -t "C,," -n "DevX Local CA" -i "${cert_out}"
+      echo "Firefox profile trusted: $(basename "${profile}")"
+    done
+    [[ "${found_ff}" == "0" ]] && echo "No Firefox profile found — skipped."
+  elif [[ "${DEVX_OS}" == "Darwin" ]]; then
+    echo "certutil not found (install: brew install nss) — skipped Firefox trust store."
+  fi
+
+  echo "Root certificate: ${cert_out}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: dev <command> [args...]
+
+Lifecycle:
+  init [--php-server=apache|nginx]   Detect stack and generate local config
+  new [--personal] <name>            Scaffold a new project folder and bring it up
+                                      [--php-server=apache|nginx]
+  up   [--php-server=apache|nginx]   Start global infra + project stack (build)
+  down [--global]                    Stop project stack (and global if --global)
+  restart                            Down then up
+  rebuild                            Rebuild images and bring stack up
+  ps                                 Show compose service status
+  logs [args...]                     Show compose logs (e.g. dev logs -f)
+  shell                              Open shell in primary app service
+  exec <svc> <cmd...>                Exec a command in any service
+  open                               Print and open project URL
+  doctor                             Show detected stack and environment health
+  trust                              Install DevX local CA into system + browser trust stores
+  db <info>                          Show DB connection info for host tools (DBeaver, etc.)
+
+Runtime (run inside the matching service container):
+  npm|npx|node|pnpm|yarn|bun <args...>
+  php|artisan|composer <args...>
+  python|py|pip <args...>
+  go <args...>
+  ruby|bundle|rails <args...>
+
+Per-project overrides: drop a .devx.yml in the project root
+(see ~/workspace/.devx/README.md for the schema).
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "${cmd}" in
+    init) shift; cmd_init "$@" ;;
+    new) shift; cmd_new "$@" ;;
+    up) shift; cmd_up "$@" ;;
+    down) shift; cmd_down "$@" ;;
+    restart) shift; cmd_restart "$@" ;;
+    rebuild) shift; cmd_rebuild "$@" ;;
+    ps) shift; cmd_ps "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    shell) shift; cmd_shell "$@" ;;
+    exec) shift; cmd_exec "$@" ;;
+    npm) shift; cmd_npm "$@" ;;
+    npx) shift; cmd_npx "$@" ;;
+    node) shift; cmd_node "$@" ;;
+    pnpm) shift; cmd_pnpm "$@" ;;
+    yarn) shift; cmd_yarn "$@" ;;
+    bun) shift; cmd_bun "$@" ;;
+    php) shift; cmd_php "$@" ;;
+    artisan) shift; cmd_artisan "$@" ;;
+    composer) shift; cmd_composer "$@" ;;
+    python) shift; cmd_python "$@" ;;
+    py) shift; cmd_python "$@" ;;
+    pip) shift; cmd_pip "$@" ;;
+    go) shift; cmd_go "$@" ;;
+    ruby) shift; cmd_ruby "$@" ;;
+    bundle) shift; cmd_bundle "$@" ;;
+    rails) shift; cmd_rails "$@" ;;
+    db) shift; cmd_db "$@" ;;
+    trust) shift; cmd_trust "$@" ;;
+    open) shift; cmd_open "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

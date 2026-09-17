@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Print `dev db info` for every project under work/ and personal/ that has a
+# database. Usage: dev-db-all
+
+workspace_root="${HOME}/workspace"
+
+for group in work personal; do
+  dir="${workspace_root}/${group}"
+  [[ -d "${dir}" ]] || continue
+  for project in "${dir}"/*/; do
+    [[ -d "${project}/.devx" ]] || continue
+    name="$(basename "${project}")"
+    out="$(cd "${project}" && dev db info 2>&1 | grep -v -E 'Running|Starting|Started' || true)"
+    if echo "${out}" | grep -q '^Engine:'; then
+      echo "================= ${group}/${name} ================="
+      echo "${out}"
+      echo
+    fi
+  done
+done

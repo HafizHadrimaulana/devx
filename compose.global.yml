@@ -1,0 +1,33 @@
+services:
+  dns:
+    image: coredns/coredns:latest
+    command:
+      - -conf
+      - /etc/coredns/Corefile
+    volumes:
+      - ./Corefile:/etc/coredns/Corefile:ro
+    ports:
+      - "127.0.0.1:53:53/udp"
+      - "127.0.0.1:53:53/tcp"
+
+  caddy:
+    image: lucaslorentz/caddy-docker-proxy:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - CADDY_INGRESS_NETWORKS=devx_ingress
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - devx_caddy_data:/data
+      - devx_caddy_config:/config
+    networks:
+      - devx_ingress
+
+volumes:
+  devx_caddy_data:
+  devx_caddy_config:
+
+networks:
+  devx_ingress:
+    name: devx_ingress
