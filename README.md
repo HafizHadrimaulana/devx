@@ -12,11 +12,10 @@ Local polyglot project runtime wrapper for:
 Built on native Docker + Docker Compose, with a global Caddy edge (TLS) and
 CoreDNS serving `*.test` to `127.0.0.1`.
 
-> **Baru di device ini / setup dari nol?** Lihat [SETUP.md](SETUP.md) buat
-> arsitektur infra, one-time host setup, dan catatan portabilitas
-> (device baru / distro lain / server). Dokumen ini (README) murni reference
-> command sehari-hari. Riwayat migrasi macOS→Linux ada di
-> [docs/MIGRATION-NOTES.md](docs/MIGRATION-NOTES.md).
+> Setup dari nol? Lihat [SETUP.md](SETUP.md) — arsitektur, host setup,
+> portabilitas. Riwayat migrasinya ada di
+> [docs/MIGRATION-NOTES.md](docs/MIGRATION-NOTES.md). README ini murni
+> reference command sehari-hari.
 
 ## Principle
 

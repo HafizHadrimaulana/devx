@@ -1,9 +1,8 @@
-# DevX — Environment & Infra (Fedora)
+# DevX — Environment & Infra
 
-Dokumen ini ngejelasin **arsitektur infra lokal**, cara **onboarding device baru**,
-dan **portabilitas** setup ini. Buat referensi command sehari-hari (`dev up`,
-`dev artisan`, dst), lihat [README.md](README.md) — dokumen itu murni reference
-command, dokumen ini konteks arsitektur + operasional.
+Arsitektur infra, cara onboarding di device baru, dan seberapa portable
+setup ini. Buat command sehari-hari (`dev up`, `dev artisan`, dst) lihat
+[README.md](README.md) — itu reference command, ini konteks arsitektur.
 
 ## 1. Arsitektur (gambaran umum)
 
@@ -41,24 +40,24 @@ command, dokumen ini konteks arsitektur + operasional.
 
 ## 2. One-time host setup (device baru)
 
-**Cara tercepat, di OS manapun (Linux/macOS):**
+Paling gampang, di Linux maupun macOS:
 
 ```bash
 # 1. Copy folder ini ke path yang SAMA PERSIS di device baru:
 #      ~/workspace/.devx
-# 2. Jalankan installer — dia deteksi OS/distro otomatis dan idempotent
-#    (aman di-re-run kalau ada step yang gagal di tengah jalan):
+# 2. Jalankan installer — deteksi OS/distro otomatis, aman di-re-run:
 ~/workspace/.devx/install.sh
 ```
 
-Installer-nya ngerjain persis urutan manual di bawah, buat 3 OS: Fedora/RHEL
-(`dnf`), Debian/Ubuntu (`apt`), dan macOS (`brew` — install Docker Desktop-nya
-sendiri manual dulu, GUI app gak bisa di-script). **Windows**: gak ada native
-support (`bin/dev` itu bash, bukan PowerShell) — jalanin di dalam **WSL2**
-(distro Linux di bawah Windows), yang otomatis kena jalur Linux di atas
-karena WSL2 punya kernel Linux beneran (`uname -s` = `Linux`). Docker Desktop
-di Windows sendiri sebenarnya sudah pakai WSL2 sebagai backend, jadi ini
-bukan workaround tambahan — itu memang cara Docker jalan di Windows.
+Installer-nya ngerjain persis urutan manual di bawah, buat Fedora/RHEL
+(`dnf`), Debian/Ubuntu (`apt`), dan macOS (`brew` — Docker Desktop-nya sendiri
+tetap harus diinstall manual, GUI app gak bisa di-script).
+
+Windows gak ada dukungan native (`bin/dev` itu bash, bukan PowerShell) —
+jalanin di dalam WSL2. Karena WSL2 punya kernel Linux beneran (`uname -s`
+= `Linux`), otomatis kepake jalur Linux di atas tanpa kode tambahan. Docker
+Desktop di Windows sendiri juga udah pakai WSL2 sebagai backend, jadi ini
+bukan workaround — memang begitu cara Docker jalan di Windows.
 
 ### Manual, step-by-step (kalau mau kontrol tiap langkah / installer gagal)
 
@@ -223,73 +222,50 @@ foldernya lalu `dev up` manual — `gclone` cuma nge-otomatisin dua langkah itu.
 
 ## 8. Portabilitas — bisa dipakai di device baru? Di server?
 
-**Ke device Fedora/RHEL baru: ya, sepenuhnya portable.** Semua yang dipakai
-(Docker CE, systemd-resolved, DNF, bash) adalah standar distro, bukan
-sesuatu yang spesifik ke laptop ini. Langkah-langkahnya persis §2 di atas —
-copy folder `~/workspace/.devx` ke path yang sama, jalanin setup sekali,
-selesai. Satu-satunya hal yang perlu diinget: path `~/workspace/.devx` itu
-**hardcoded** di beberapa tempat di `bin/dev` (`DEVX_HOME`), jadi harus
-persis sama di device baru — bukan sesuatu yang dikonfigurasi via env var.
+**Device Fedora/RHEL lain** — tinggal copy folder ke path yang sama dan
+ikutin §2, selesai. Docker, systemd-resolved, DNF — semua standar distro,
+gak ada yang spesifik ke laptop ini. Satu hal yang wajib sama persis: path
+`~/workspace/.devx`, karena itu hardcoded di `bin/dev` (`DEVX_HOME`), bukan
+dikonfigurasi lewat env var.
 
-**Ke distro Linux lain (Ubuntu/Debian dll): ya, `install.sh` deteksi otomatis.**
-`bin/dev` sendiri sudah distro-agnostic (deteksi `update-ca-trust` vs
-`update-ca-certificates` buat trust CA, `systemd-resolved` biasanya identik
-di semua distro desktop modern). Cuma paket dependensi awal (`nss-tools` vs
-`libnss3-tools`) yang beda nama — `install.sh` sudah nangani ini otomatis.
+**Ubuntu/Debian** — `install.sh` udah deteksi otomatis, tinggal jalanin.
+`bin/dev` sendiri gak peduli distro (dia cek command apa yang ada:
+`update-ca-trust` atau `update-ca-certificates`), cuma nama paket awal yang
+beda (`nss-tools` vs `libnss3-tools`), dan itu udah ditangani installer-nya.
 
-**Ke macOS: ya, native, sudah diimplementasikan** (`bin/dev` deteksi
-`uname -s == Darwin` dan cabang ke `security`/Keychain buat trust CA, cek
-`/etc/resolver/test` buat diagnostic, dst). **Catatan jujur:** ini dikerjain
-lewat pembacaan kode yang cermat (tahu behavior macOS Keychain, NSS Firefox,
-systemd vs launchd), **bukan hasil test langsung di mesin Mac** — belum ada
-akses ke Mac buat verifikasi live. Kalau kamu/temen kamu pakai Mac, jalanin
-`dev doctor` dan `dev trust` dulu buat mastiin, terus laporin kalau ada yang
-meleset.
+**macOS** — udah didukung native (`bin/dev` cek `uname -s`, cabang ke
+`security`/Keychain buat trust CA). Jujur aja: ini saya kerjain dari
+pembacaan kode, bukan dari nge-test beneran di mesin Mac — belum ada akses
+ke Mac. Kalau kamu atau temen kamu coba di Mac, jalanin `dev doctor` sama
+`dev trust` dulu dan kabarin kalau ada yang aneh.
 
-**Ke Windows: ya, lewat WSL2** (bukan native PowerShell — `bin/dev` itu bash,
-nulis ulang ke PowerShell adalah proyek terpisah yang jauh lebih besar).
-Di dalam WSL2, `uname -s` tetap `Linux`, jadi otomatis kena jalur Linux di
-atas tanpa kode tambahan. Docker Desktop di Windows sendiri sudah pakai WSL2
-sebagai backend — install Docker Desktop, aktifkan **WSL Integration** buat
-distro WSL2 kamu, lalu ikutin langkah Linux biasa **di dalam** WSL2. Satu
-catatan: kalau WSL2 kamu gak punya `systemd` aktif (`systemctl` gak ada),
-setup DNS `systemd-resolved` gak akan jalan — `dev doctor` bakal bilang
-"UNKNOWN" buat resolver, dan kamu perlu fallback manual (tambah entry
-eksplisit per-project ke hosts file Windows, `C:\Windows\System32\drivers\etc\hosts`,
-karena Windows gak punya wildcard DNS native tanpa software tambahan).
+**Windows** — lewat WSL2, bukan PowerShell native (nulis ulang 1750 baris
+bash ke PowerShell itu kerjaan lain, bukan sekadar port). Di dalam WSL2
+`uname -s` tetep `Linux`, jadi otomatis kepake jalur Linux tanpa kode
+tambahan — dan ini emang cara Docker Desktop di Windows jalan juga (WSL2
+sebagai backend). Install Docker Desktop, nyalain WSL Integration buat
+distronya, lalu ikutin setup Linux biasa di dalam situ. Satu ganjelan: kalau
+WSL2-nya gak punya systemd aktif, setup DNS `systemd-resolved` gak jalan —
+`dev doctor` bakal bilang resolver "UNKNOWN", dan solusinya manual: tambahin
+entry per-project ke hosts file Windows (`C:\Windows\System32\drivers\etc\hosts`),
+karena Windows gak punya wildcard DNS bawaan.
 
-**Ke server (headless, tanpa GUI): ya, tapi dengan penyesuaian tujuan.**
-Yang **langsung jalan tanpa ubahan**: Docker, CoreDNS, Caddy, generate
-compose per-project, DB port-lock — semuanya headless-native, gak butuh GUI
-sama sekali.
+**Server headless** — inti-nya (Docker, CoreDNS, Caddy, generate compose)
+gak butuh GUI sama sekali, jalan apa adanya. Yang perlu dipikir ulang kalau
+target-nya server bersama (bukan cuma "laptop tanpa monitor"):
 
-Yang **perlu dipikir ulang** kalau target-nya server (bukan cuma "laptop dev
-tapi kebetulan gak ada monitor"):
-1. **`dev trust`** — bagian `certutil`/browser trust store gak relevan
-   (server gak punya browser lokal). Bagian `update-ca-trust` (system-wide)
-   tetap berguna kalau ada service lain di server yang perlu percaya sertifikat
-   internal ini.
-2. **`*.test` DNS** — di server, domain `.test` cuma resolve ke `127.0.0.1`
-   buat proses **di server itu sendiri**. Kalau mau diakses dari luar
-   (device lain di jaringan/tim), CoreDNS-nya harus di-bind ke IP yang bisa
-   diakses jaringan (bukan `127.0.0.1:53`), dan DNS server itu didaftarkan
-   di resolver client-nya (router/`/etc/resolv.conf` tim) — bukan
-   `resolved.conf.d` lokal per-mesin lagi.
-3. **Port publish DB ke `127.0.0.1`** — desain sekarang sengaja cuma bind ke
-   loopback (aman buat single-user laptop). Di server multi-tenant, ini
-   perlu firewall/binding policy tambahan kalau mau tetap diakses (mis. lewat
-   VPN/SSH tunnel, bukan expose langsung).
-4. **`gclone`/`dev new` auto-`dev up`** — di server biasanya deployment
-   dikontrol CI/CD, bukan clone interaktif manual. Pola ini tetap valid buat
-   *staging/dev server bersama*, tapi bukan pengganti pipeline produksi.
-5. **Workspace `work/`+`personal/`** — konvensi ini masuk akal buat laptop
-   personal; di server tim, mungkin lebih pas jadi `work/` doang (gak ada
-   konsep "personal" di server bersama).
-
-**Ringkasnya:** inti arsitekturnya (Docker + Caddy + CoreDNS + generate
-compose per-project) portable dan headless-native tanpa syarat. Yang perlu
-disesuaikan itu spesifik ke **skala pemakaian** (single laptop vs server
-bersama), bukan ke OS/platform-nya.
+- `dev trust` bagian browser (`certutil`) gak relevan — gak ada browser di
+  server. Bagian system-wide (`update-ca-trust`) masih berguna kalau ada
+  service lain yang perlu percaya sertifikat ini.
+- DNS `.test` cuma resolve buat proses di server itu sendiri. Biar bisa
+  diakses device lain, CoreDNS-nya harus bind ke IP jaringan (bukan
+  `127.0.0.1`), dan didaftarin di resolver client-nya masing-masing.
+- Port DB yang di-publish ke `127.0.0.1` itu desain buat laptop single-user
+  — di server bersama butuh firewall/VPN tambahan kalau mau tetap diakses.
+- `gclone`/`dev new` cocok buat staging/dev server bersama, tapi bukan
+  pengganti pipeline CI/CD buat produksi.
+- Struktur `work/`+`personal/` masuk akal buat laptop pribadi; di server
+  tim mungkin cukup `work/` doang.
 
 ## 9. Riwayat perubahan penting (changelog ringkas)
 
