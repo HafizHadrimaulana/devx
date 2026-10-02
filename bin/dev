@@ -203,8 +203,8 @@ determine_php_server() {
 #     version: "18"
 #
 # Tanpa itu, nilai lamanya dipakai — proyek lain tidak ikut berubah. Ini ada
-# karena beberapa proyek MEWAJIBKAN versi mayor tertentu (mis. sitms-core
-# butuh PostgreSQL 18) dan "kebetulan sama di laptop siapa" bukan jaminan.
+# karena sebagian proyek MEWAJIBKAN versi mayor tertentu (mis. harus
+# PostgreSQL 18) dan "kebetulan sama di laptop siapa" bukan jaminan.
 detect_postgres_version() {
   local v; v="$(mf postgres_version)"; [[ -n "${v}" ]] && { echo "${v}"; return; }
   echo "16"
