@@ -150,6 +150,11 @@ regular service (always started with the stack) with its own named volume.
 
 ## Generated PHP mode
 
+- PHP extensions are detected from **both `composer.json` and `composer.lock`**
+  — platform requirements (`ext-gd`, `ext-intl`, …) are usually declared by
+  dependencies, not the root manifest, so scanning only the root builds an
+  image that `composer install` then refuses to run on. Handled: bcmath, intl,
+  gd, exif, pcntl, zip, redis (pecl), plus pdo_mysql/pdo_pgsql.
 - default `nginx` (php-fpm + nginx), optional `apache`
 - document root auto-set to `public/` for Laravel or when a `public/` dir
   exists; otherwise served from the project root
@@ -159,6 +164,23 @@ regular service (always started with the stack) with its own named volume.
 dev init --php-server=nginx
 dev up   --php-server=nginx
 ```
+
+## Laravel: writable directories
+
+`dev init`/`dev up` recreate the runtime directories Laravel needs but git
+doesn't carry — `storage/framework/{cache/data,sessions,testing,views}`,
+`storage/app/public`, `storage/logs`, `bootstrap/cache`.
+
+Many repos ignore these so broadly (a bare `/storage/framework/*` with no
+`.gitkeep` escape) that they're simply absent after a clone, and Laravel then
+500s with a message that names no path at all:
+
+```
+InvalidArgumentException: Please provide a valid cache path.
+```
+
+Creating them is idempotent, so this is a no-op where they already exist — it
+just means a fresh clone never has to rediscover it, on any machine.
 
 ## Per-project override: `.devx.yml`
 

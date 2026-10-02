@@ -338,9 +338,20 @@ detect_ruby_framework() {
 }
 
 composer_requires_extension() {
-  local ext_name="$1"
-  [[ -f "${PROJECT_ROOT}/composer.json" ]] || return 1
-  rg -nq "\"ext-${ext_name}\"\\s*:" "${PROJECT_ROOT}/composer.json"
+  local ext_name="$1" f
+  # Scan composer.lock as well as composer.json: platform requirements are
+  # usually declared by *dependencies*, not the root manifest. A Laravel app
+  # can have zero "ext-*" in composer.json while its lock needs gd (pulled in
+  # by phpspreadsheet), intl and pcntl — scanning only the root then builds a
+  # PHP image without them and `composer install` refuses to run on it. Only
+  # extensions devx explicitly knows how to install are acted on (see
+  # write_generated_php_assets), so a broad scan can't pull in something
+  # unbuildable.
+  for f in "${PROJECT_ROOT}/composer.json" "${PROJECT_ROOT}/composer.lock"; do
+    [[ -f "${f}" ]] || continue
+    rg -nq "\"ext-${ext_name}\"\\s*:" "${f}" && return 0
+  done
+  return 1
 }
 
 env_value() {
@@ -1433,8 +1444,36 @@ db_credentials_from_env() {
 # Orchestration
 # ---------------------------------------------------------------------------
 
+# Laravel keeps its writable runtime directories out of git, and many repos
+# ignore them so broadly (e.g. a bare `/storage/framework/*` with no .gitkeep
+# escape) that the directories simply don't exist after a clone. Laravel then
+# fails at the first request with a 500 whose message names no path at all:
+#
+#   InvalidArgumentException: Please provide a valid cache path.
+#
+# Recreating them is idempotent, costs nothing when they already exist, and
+# applies to every clone on every machine — which is the only way to stop each
+# fresh checkout rediscovering this. bootstrap/cache is included because the
+# package manifest fails the same way.
+ensure_laravel_writable_dirs() {
+  [[ "${IS_LARAVEL}" == "1" ]] || return 0
+  local d
+  for d in \
+    storage/framework/cache/data \
+    storage/framework/sessions \
+    storage/framework/testing \
+    storage/framework/views \
+    storage/app/public \
+    storage/logs \
+    bootstrap/cache
+  do
+    mkdir -p "${PROJECT_ROOT}/${d}"
+  done
+}
+
 prepare_project_config() {
   detect_stack
+  ensure_laravel_writable_dirs
   write_project_env
   sync_project_env
   if [[ -n "${DEVX_BASE_COMPOSE}" ]]; then
