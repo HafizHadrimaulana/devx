@@ -1717,6 +1717,63 @@ cmd_open() {
   fi
 }
 
+# Warn when the app image's platform and the platform node_modules was
+# installed for disagree. That is the usual cause of a container that dies on
+# boot with a missing native binding ("Cannot find module
+# '@swc/core-linux-x64-musl'", and similar for esbuild/rollup/lightningcss) —
+# a floating tag can resolve to a different arch than the deps were built for.
+doctor_runtime_platform() {
+  local svc cid image imgarch nodearch ok=0
+  svc="$(resolve_js_service 2>/dev/null || true)"
+  [[ -n "${svc}" ]] || return 0
+
+  cid="$(dc ps -aq "${svc}" 2>/dev/null | sed -n '1p' || true)"
+  [[ -n "${cid}" ]] || return 0
+
+  image="$(docker inspect --format '{{.Config.Image}}' "${cid}" 2>/dev/null || true)"
+  [[ -n "${image}" ]] || return 0
+
+  imgarch="$(docker image inspect "${image}" --format '{{.Architecture}}' 2>/dev/null || true)"
+  [[ -n "${imgarch}" ]] || return 0
+
+  # Platform the deps were installed for, read from the pnpm store dir names
+  # (e.g. "@esbuild+linux-arm64@…", "@rollup+rollup-linux-x64-musl@…").
+  nodearch="$(ls "${PROJECT_ROOT}/node_modules/.pnpm" 2>/dev/null \
+    | grep -oE '(linux|darwin)-(arm64|x64)' | sort -u | tr '\n' ' ' || true)"
+  [[ -n "${nodearch}" ]] || return 0
+
+  case "${imgarch}" in
+    arm64|aarch64) [[ "${nodearch}" == *linux-arm64* ]] && ok=1 ;;
+    amd64|x86_64)  [[ "${nodearch}" == *linux-x64* ]] && ok=1 ;;
+    *) return 0 ;;
+  esac
+
+  if [[ "${ok}" == "1" ]]; then
+    echo "Runtime platform: OK (image ${image}=${imgarch} matches installed deps)"
+  else
+    echo "Runtime platform: MISMATCH — image ${image} is ${imgarch}, deps installed for: ${nodearch:-unknown}"
+    echo "  fix: re-pull the native arch, or: dev exec ${svc} rm -rf node_modules && dev pnpm install"
+  fi
+}
+
+# Count RUNNING containers that have this project directory bind-mounted.
+# More than one means a second server is likely writing the same on-disk
+# caches inside node_modules (Vite's .vite, …) — see Gotchas.
+doctor_checkout_containers() {
+  local root="${PROJECT_ROOT}" cid mounts count=0
+  while IFS= read -r cid; do
+    [[ -n "${cid}" ]] || continue
+    mounts="$(docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "${cid}" 2>/dev/null || true)"
+    printf '%s\n' "${mounts}" | grep -qxF "${root}" && count=$((count + 1))
+  done < <(docker ps -q 2>/dev/null || true)
+
+  if [[ "${count}" -gt 1 ]]; then
+    echo "Checkout containers: ${count} running with this project mounted — run ONE dev server per checkout"
+  else
+    echo "Checkout containers: ${count}"
+  fi
+}
+
 cmd_doctor() {
   load_context
   detect_stack
@@ -1759,6 +1816,8 @@ cmd_doctor() {
     else
       echo "Caddy CA: not yet created (start a project with 'dev up' first)"
     fi
+    doctor_runtime_platform
+    doctor_checkout_containers
   else
     echo "Docker: OFFLINE"
   fi

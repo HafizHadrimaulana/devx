@@ -244,7 +244,9 @@ Short version:
   (drop-in at `/etc/systemd/resolved.conf.d/devx-test-tld.conf`)
 - Trust the local CA (after the first `dev up`): `dev trust`
 
-`dev doctor` checks both.
+`dev doctor` checks both, plus two runtime health checks: whether the app
+image's platform matches the one `node_modules` was installed for, and how many
+running containers have this project mounted (it should be one — see Gotchas).
 
 ## Network topology (important)
 
@@ -346,6 +348,26 @@ non-colliding port from scratch.
   stopped. Start the stack (`dev up`) — the port itself won't have changed
   (it's locked in `.devx/.env`), so no need to re-check it unless that file
   was deleted or the project was re-inited from scratch.
+- **Never run a second dev server against the same checkout.** `node_modules`
+  is bind-mounted, so any on-disk cache a tool keeps inside it — Vite's
+  `node_modules/.vite` is the usual one — is **shared by every container that
+  mounts the project**. Two running servers/optimizers write it concurrently
+  and corrupt it: chunk names change while the browser still holds the old
+  `?v=` hash, so dep chunks start returning 504 and pages fail with
+  `Failed to fetch dynamically imported module`. Run one-off tooling
+  (audits, screenshots, scripts) **against the server that is already up**
+  (`dev exec <svc> …`) instead of starting another one. Fix when it happens:
+  `dev down && rm -rf node_modules/.vite && dev up`, then **hard-reload** the
+  tab (it still holds the stale URLs).
+- **A service image's platform must match what `node_modules` was installed
+  for.** If a floating tag resolves to a different architecture than the one
+  the deps were installed on — e.g. `node:24-alpine` pulled as `amd64` on an
+  `arm64` host — the container dies on boot with a missing native binding
+  (`Cannot find module '@swc/core-linux-x64-musl'`, similar for
+  esbuild/rollup/lightningcss). Check with
+  `docker image inspect <image> --format '{{.Architecture}} {{.Os}}'`, then
+  either re-pull the native arch (`docker pull --platform linux/arm64
+  <image>`) or reinstall deps inside the container.
 
 ## Notes
 
